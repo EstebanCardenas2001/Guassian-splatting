@@ -15,3 +15,5 @@ pycolmap
 viser
 jupyterlab
 rembg[gpu]
+huggingface_hub
+scikit-image

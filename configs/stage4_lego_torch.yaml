@@ -1,0 +1,37 @@
+_base_: base.yaml
+name: stage4_lego_torch
+
+data:
+  type: blender
+  path: data/nerf_synthetic/lego
+  downscale: 2              # 800 -> 400 px
+  bg: [1.0, 1.0, 1.0]
+  eval_subset: 20           # test views used for periodic evaluation (all 200 at the end)
+
+model:
+  init: random_box
+  n: 100000
+  box: [-1.3, 1.3]          # as 3DGS for NeRF-synthetic
+  scale_factor: 0.25        # initial scale = scale_factor * mean spacing (2.6 / n^(1/3))
+  opacity: 0.1
+
+render:
+  backend: torch            # torch | gsplat (Stage 5)
+  eps2d: 0.3
+  antialiased: false
+
+train:
+  iterations: 30000
+  lambda_dssim: 0.2
+  # Adam learning rates, 3DGS-style. Position LR = 1.6e-4 * scene extent (~4), decayed
+  # exponentially to 1/100 of it; the others are constant.
+  lr:
+    means: 6.4e-4
+    quats: 1.0e-3
+    log_scales: 5.0e-3
+    opacity_logits: 5.0e-2
+    color_logits: 5.0e-3
+  means_lr_final: 6.4e-6
+  log_every: 100
+  eval_every: 1000
+  ckpt_every: 1000

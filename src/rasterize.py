@@ -44,9 +44,10 @@ def conic_quadratic(dx: Tensor, dy: Tensor, conic: Tensor) -> Tensor:
 
 @torch.no_grad()
 def enumerate_pairs(means2d: Tensor, conics: Tensor, radii: Tensor, H: int, W: int,
-                    depths: Tensor | None, sort: bool,
+                    depths: Tensor | None, sort: bool, q_max: Tensor | None = None,
                     max_pairs: int = 80_000_000) -> tuple[Tensor, Tensor, Tensor]:
-    """Integer (Gaussian, pixel) pairs with q < 9. Returns (gid, px, py), each (P,) int64.
+    """Integer (Gaussian, pixel) pairs with q < q_max (default 9, the 3-sigma ellipse;
+    or a per-Gaussian (N,) tensor). Returns (gid, px, py), each (P,) int64.
 
     The candidate box of Gaussian k is the set of pixels whose *centers* lie within
     radii[k] of the mean along x and y, clipped to the image:
@@ -77,7 +78,8 @@ def enumerate_pairs(means2d: Tensor, conics: Tensor, radii: Tensor, H: int, W: i
     py = y0[gid] + k // w
     dx = px.to(m.dtype) + 0.5 - m[gid, 0]
     dy = py.to(m.dtype) + 0.5 - m[gid, 1]
-    ok = conic_quadratic(dx, dy, conics.detach()[gid]) < Q_CUTOFF
+    cut = Q_CUTOFF if q_max is None else q_max.detach()[gid]
+    ok = conic_quadratic(dx, dy, conics.detach()[gid]) < cut
     gid, px, py = gid[ok], px[ok], py[ok]
     if sort:
         rank = (torch.arange(N, device=dev) if depths is None
@@ -90,9 +92,12 @@ def enumerate_pairs(means2d: Tensor, conics: Tensor, radii: Tensor, H: int, W: i
 def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
               opacities: Tensor, H: int, W: int, depths: Tensor | None = None,
               bg: Tensor | None = None, mode: str = "alpha", t_min: float = 1e-4,
-              alpha_min: float = 0.0) -> tuple[Tensor, Tensor, dict]:
+              alpha_min: float = 0.0, q_max: Tensor | None = None) -> tuple[Tensor, Tensor, dict]:
     """Render screen-space Gaussians (see module docstring). Differentiable w.r.t.
-    means2d, conics, colors, opacities (and bg); radii and depths only select/sort.
+    means2d, conics, colors, opacities (and bg); radii, depths and q_max only select/sort.
+
+    ``q_max`` (N,) optionally tightens the per-Gaussian support below q < 9 (e.g. to where
+    alpha >= alpha_min, which leaves the image unchanged but evaluates fewer pairs).
 
     Returns:
         image (H, W, D), alpha (H, W) = 1 - T_final (alpha mode; additive: sum of weights),
@@ -101,7 +106,8 @@ def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
     if mode not in ("additive", "alpha"):
         raise ValueError(f"unknown mode {mode!r}")
     D = colors.shape[-1]
-    gid, px, py = enumerate_pairs(means2d, conics, radii, H, W, depths, sort=(mode == "alpha"))
+    gid, px, py = enumerate_pairs(means2d, conics, radii, H, W, depths, sort=(mode == "alpha"),
+                                  q_max=q_max)
     pix = py * W + px
 
     # One packed gather: (P, 2 + 3 + 1 + D) = mean, conic, opacity, color.

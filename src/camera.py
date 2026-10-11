@@ -115,3 +115,46 @@ def sphere_cameras(n: int, radius: float, fov_deg: float, W: int, H: int,
         cams.append(Camera(look_at(target + radius * d, target, up), K.clone(), W, H,
                            name=f"sphere_{i:03d}"))
     return cams
+
+
+# Blender's camera axes (x right, y up, z backward) -> OpenCV (x right, y down, z forward):
+# negate the camera's y and z axes, i.e. right-multiply camera-to-world by diag(1, -1, -1, 1).
+OPENGL_TO_OPENCV = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0]))
+
+
+def load_blender(scene_dir, split: str, downscale: int = 1, bg=(1.0, 1.0, 1.0)
+                 ) -> tuple[list[Camera], Tensor]:
+    """NeRF-synthetic split -> (cameras, images uint8 (N, H, W, 3)).
+
+    ``transforms_<split>.json`` holds ``camera_angle_x`` (full horizontal FOV, radians)
+    and per-frame ``transform_matrix``: camera-to-world in the OpenGL convention.
+    viewmat = inverse(c2w_gl @ OPENGL_TO_OPENCV). Images are RGBA; they are composited
+    onto ``bg`` at full resolution (C = a rgb + (1 - a) bg) and then area-downsampled by
+    ``downscale`` (compositing and box filtering are both linear, so the order is exact
+    for box filtering). Intrinsics: f = W / (2 tan(fov/2)), principal point at the center.
+    """
+    import json
+    from pathlib import Path
+
+    import cv2
+    import numpy as np
+
+    scene_dir = Path(scene_dir)
+    meta = json.loads((scene_dir / f"transforms_{split}.json").read_text())
+    bg = np.asarray(bg, np.float32)
+    cams, imgs = [], []
+    for fr in meta["frames"]:
+        path = scene_dir / (fr["file_path"].removeprefix("./") + ".png")
+        rgba = cv2.cvtColor(cv2.imread(str(path), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGRA2RGBA)
+        rgba = rgba.astype(np.float32) / 255.0
+        rgb = rgba[..., :3] * rgba[..., 3:] + (1.0 - rgba[..., 3:]) * bg
+        H0, W0 = rgb.shape[:2]
+        W, H = W0 // downscale, H0 // downscale
+        if downscale > 1:
+            rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+        imgs.append(torch.from_numpy(np.clip(rgb * 255 + 0.5, 0, 255).astype(np.uint8)))
+        c2w = torch.tensor(fr["transform_matrix"], dtype=torch.float64) @ OPENGL_TO_OPENCV.double()
+        f = focal_from_fov(meta["camera_angle_x"], W)
+        cams.append(Camera(torch.linalg.inv(c2w).float(), intrinsics_matrix(f, f, W / 2, H / 2),
+                           W, H, name=Path(fr["file_path"]).name))
+    return cams, torch.stack(imgs)

@@ -129,8 +129,17 @@ def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colo
         and ``pairs``.
     """
     proj = project_gaussians(means, quats, scales, viewmat, K, W, H, near, far, eps2d, antialiased)
-    img, alpha, info = rasterize(proj["means2d"], proj["conics"], proj["radii"], colors,
-                                 opacities * proj["opacity_scale"], H, W, depths=proj["depths"],
-                                 bg=bg, t_min=t_min, alpha_min=alpha_min)
+    opac = opacities * proj["opacity_scale"]
+    radii, q_max = proj["radii"], None
+    if alpha_min > 0:
+        # Opacity-aware support (as in gsplat): alpha = o exp(-q/2) >= alpha_min  <=>
+        # q <= 2 ln(o / alpha_min). Pairs beyond it would be skipped anyway, so the image is
+        # unchanged; it only avoids enumerating them. Shrinks the pixel box accordingly.
+        with torch.no_grad():
+            q_max = (2 * torch.log(opac.detach() / alpha_min)).clamp(max=9.0)
+            radii = torch.where(q_max > 0, radii * torch.sqrt(q_max.clamp(min=0) / 9.0), 0.0)
+    img, alpha, info = rasterize(proj["means2d"], proj["conics"], radii, colors, opac, H, W,
+                                 depths=proj["depths"], bg=bg, t_min=t_min, alpha_min=alpha_min,
+                                 q_max=q_max)
     info.update(proj)
     return img, alpha, info
