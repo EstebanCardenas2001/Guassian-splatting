@@ -12,7 +12,7 @@ and explained before the next; this README is updated with the results of every 
 | 2 | 3D forward model in pure PyTorch | ✅ 15 tests incl. gradcheck, EWA vs Monte Carlo |
 | 3 | Synthetic inverse problem | ✅ exact recovery from GT+noise; 81.5 % from random init, 97.5 % with 2× Gaussians |
 | 4 | Blender lego with my renderer | ✅ 27.88 dB at 400² (no densification); breaks at ~80 M pairs / 10 h per run at 800² |
-| 5 | Tiled CUDA rasterizer (gsplat) | next |
+| 5 | Tiled CUDA rasterizer (gsplat) | ✅ 32.96 dB at 800² with gsplat's reference densification; my own densification next |
 | 6 | Plant data pipeline | |
 | 7 | Plant training ablations | |
 | 8 | Pushing the T4 to maximum detail | |
@@ -495,6 +495,106 @@ work:
 
 ---
 
+## Stage 5: Tiled CUDA rasterizer (gsplat), same training loop
+
+Code: [`src/render_gsplat.py`](src/render_gsplat.py) (same interface as `render_torch`),
+[`tests/test_render_gsplat.py`](tests/test_render_gsplat.py),
+[`scripts/stage5_agreement.py`](scripts/stage5_agreement.py),
+[`configs/stage5_lego_gsplat*.yaml`](configs/).
+
+### What gsplat does differently (read from its 1.5.3 CUDA source)
+
+* **Tiles instead of pairs.** Each Gaussian is assigned to the 16×16 tiles its bounding box
+  overlaps, (tile, Gaussian) keys are radix-sorted once by depth, and one CUDA block per
+  tile composites its list in shared memory and *stops* once every pixel in the tile is
+  saturated. Hidden Gaussians are never evaluated, which is exactly the work the
+  pair-based PyTorch renderer couldn't skip (Stage 4).
+* **Constants.** α clamp 0.999 (the 3DGS paper uses 0.99); support is an opacity-aware box
+  of half-width $\min(3.33, \sqrt{2\ln(255\,o)})\sqrt{\Sigma'_{ii}}$ per axis, with no
+  ellipse test. `render_torch` gained `alpha_max` and `q_cutoff` parameters to reproduce
+  them; its defaults are unchanged, so Stages 1–4 reproduce exactly.
+* **Packed mode** (default here) carries only the visible Gaussians through the pipeline.
+  Its 1.5.3 shape check rejects a background, so the wrapper composites
+  $C + (1-\alpha)\,\text{bg}$ itself (the same $T_\text{final}\cdot\text{bg}$ term).
+
+### Numerical agreement
+
+With gsplat's constants, the two renderers agree **to float32 precision** (300 random
+anisotropic Gaussians, 160×120, white background):
+
+| scene | mode | max \|Δ image\| | mean \|Δ image\| | max \|Δ alpha\| |
+|---|---|---|---|---|
+| seed 0 | classic | 1.0e-06 | 4.4e-08 | 1.2e-06 |
+| seed 0 | antialiased | 1.1e-06 | 4.3e-08 | 1.3e-06 |
+| seed 1 | classic | 6.9e-07 | 4.1e-08 | 1.4e-06 |
+| seed 2 | classic | 9.5e-07 | 5.0e-08 | 7.2e-07 |
+
+| parameter | cosine(∇torch, ∇gsplat) | ‖Δ∇‖ / ‖∇torch‖ |
+|---|---|---|
+| means | 1.000000 | 8.4e-06 |
+| quats | 1.000000 | 5.2e-06 |
+| scales | 1.000000 | 7.3e-06 |
+| opacities | 1.000000 | 8.9e-06 |
+| colors | 1.000000 | 1.6e-05 |
+
+Packed and unpacked modes give identical images. The tests assert max |Δ| < 10⁻⁵ and
+gradient cosine > 0.99999.
+
+![Agreement](docs/figures/stage5_agreement.png)
+
+### Speed and memory: same trained-lego states as Stage 4
+
+| resolution | N | PyTorch ms | gsplat ms | speed-up | PyTorch GB | gsplat GB |
+|---|---|---|---|---|---|---|
+| 200² | 100k | 48 | 5.3 | 9× | 0.14 | 0.01 |
+| 200² | 3M | 800 | 36.5 | 22× | 3.54 | 0.32 |
+| 400² | 1M | 455 | 15.5 | 29× | 2.87 | 0.12 |
+| 400² | 3M | 1382 | 32.0 | 43× | 8.53 | 0.32 |
+| 800² | 300k | 368 | 20.0 | 18× | 2.82 | 0.13 |
+| 800² | 1M | 1198 | 26.3 | 46× | 9.25 | 0.17 |
+| 800² | 3M | **OOM** | 47.8 | — | OOM | 0.33 |
+
+![Benchmark](docs/figures/stage5_benchmark.png)
+
+### Lego at 800×800
+
+My training loop, unchanged apart from the backend. The fixed-set runs (no
+densification) come first, because the plan schedules densification for Stage 7:
+
+| run | Gaussians | test PSNR (200 views) | SSIM | train / test gap | time | peak VRAM |
+|---|---|---|---|---|---|---|
+| fixed random set | 100k | 26.83 | 0.910 | — | 9 min | 0.71 GB |
+| fixed random set | 300k | 28.95 | 0.941 | — | 11 min | 0.79 GB |
+| fixed random set | 1M | 28.06 | 0.945 | 4.5 dB | 17 min | 1.1 GB |
+| **+ adaptive density control** (gsplat `DefaultStrategy`) | 100k → 360k | **32.96** | **0.977** | 3.7 dB | 16 min | 0.82 GB |
+
+**Why the fixed set stalls at ~29 dB.** Splitting the squared error by the ground-truth
+alpha mask:
+* Floaters in empty space account for 20 % of the error with 1M Gaussians, vs 3–4 % with
+  100k–300k. That explains 1M < 300k.
+* Even at 300k, **97 % of the error is on the object itself**. A fixed, randomly placed set
+  can't put capacity where the fine detail is; more Gaussians only add floaters (train
+  32.6 dB vs test 28.2 dB at 1M).
+
+**Adaptive density control fixes exactly that.** gsplat's `DefaultStrategy` implements the
+3DGS paper's rules:
+* Every 100 steps it clones small Gaussians and splits large ones whose accumulated
+  screen-space gradient exceeds 2·10⁻⁴, and prunes those with opacity < 0.005 or that are
+  too large.
+* Every 3000 steps it resets opacity to kill floaters.
+* All of this runs between iterations 500 and 15k.
+
+Hooked into my loop (one Adam per tensor, called after the optimizer step as in gsplat's
+reference trainer), it first pruned the 100k random Gaussians to ~43k, then grew them to
+360k where detail was missing, and passed 32 dB at ~12k iterations. This run is the
+reference that my own `densify.py` (next step) has to match.
+
+![Lego renders](docs/figures/stage5_renders.png)
+
+![Stage 5 curves](docs/figures/stage5_curves.png)
+
+---
+
 ## Repository layout
 
 ```
@@ -504,9 +604,11 @@ outputs/   -> /mnt/outputs   (runs; not in git)
 docs/figures/                figures embedded in this README
 scripts/      setup_env.sh, check_env.py, gpu_bench.py, gsplat_smoke.py, tensorboard.sh,
               stage1_sweep.sh, plot_stage1.py, stage2_scene.py, stage3_sweep.sh,
-              plot_stage3.py, profile_torch_renderer.py, plot_stage4.py
+              plot_stage3.py, profile_torch_renderer.py, plot_stage4.py,
+              stage5_agreement.py, plot_stage5.py
 src/          config.py, run.py, splat2d.py, fit2d.py, rasterize.py, gaussians.py,
-              camera.py, render_torch.py, synthetic.py, fit_synthetic.py, losses.py, train.py,
+              camera.py, render_torch.py, render_gsplat.py, synthetic.py, fit_synthetic.py,
+              losses.py, train.py,
               and stubs for later stages
 tests/        pytest suite
 ```

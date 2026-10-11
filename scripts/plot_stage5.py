@@ -31,10 +31,11 @@ def style(ax):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
+    ap.add_argument("--run", required=True, help="best Stage 5 run (densified)")
+    ap.add_argument("--fixed", required=True, help="best Stage 5 run without densification")
     ap.add_argument("--stage4", required=True)
     args = ap.parse_args()
-    run, run4 = Path(args.run), Path(args.stage4)
+    run, runf, run4 = Path(args.run), Path(args.fixed), Path(args.stage4)
 
     # ---- benchmark: ms and GB vs N, one panel per resolution
     prof = {b: json.load(open(f"/mnt/outputs/profiles/{b}_trained.json")) for b in ("torch", "gsplat")}
@@ -60,31 +61,38 @@ def main():
     axes[0, 0].legend(frameon=False, fontsize=8)
     fig.tight_layout(); fig.savefig(OUT / "stage5_benchmark.png"); plt.close(fig)
 
-    # ---- renders: GT | Stage 4 (400², upsampled) | Stage 5 (800²), full + zoom
+    # ---- renders: GT | Stage 4 (400², upsampled) | Stage 5 fixed set | Stage 5 densified, full + zoom
     f5 = sorted((run / "renders").glob("test_*.png"))[:2]
-    fig, axes = plt.subplots(2 * len(f5), 3, figsize=(10.5, 7 * len(f5)), dpi=150)
+    cols = 4
+    fig, axes = plt.subplots(2 * len(f5), cols, figsize=(3.4 * cols, 7 * len(f5)), dpi=150)
     for k, f in enumerate(f5):
-        im5 = iio.imread(f); w = im5.shape[1] // 2
-        gt, r5 = im5[:, :w], im5[:, w:]
-        im4 = iio.imread(run4 / "renders" / f.name); w4 = im4.shape[1] // 2
-        r4 = np.repeat(np.repeat(im4[:, w4:], 2, 0), 2, 1)          # 400 -> 800, nearest
-        y0, x0, s = 330, 300, 160                                    # zoom on the bucket / tracks
-        for c, (im, t) in enumerate(((gt, "ground truth 800²"), (r4, "Stage 4: PyTorch, 400² (×2)"),
-                                     (r5, "Stage 5: gsplat, 800²"))):
+        def half(p, right=True):
+            im = iio.imread(p); w = im.shape[1] // 2
+            return im[:, w:] if right else im[:, :w]
+        gt, r5 = half(f, False), half(f)
+        rf = half(runf / "renders" / f.name)
+        r4 = np.repeat(np.repeat(half(run4 / "renders" / f.name), 2, 0), 2, 1)   # 400 -> 800, nearest
+        y0, x0, s = 330, 300, 160                                    # zoom window
+        tiles = ((gt, "ground truth 800²"), (r4, "Stage 4: PyTorch 400², 100k fixed (×2)"),
+                 (rf, "Stage 5: gsplat 800², 300k fixed"), (r5, "Stage 5: gsplat 800² + densification"))
+        for c, (im, t) in enumerate(tiles):
             axes[2 * k, c].imshow(im); axes[2 * k + 1, c].imshow(im[y0:y0 + s, x0:x0 + s], interpolation="nearest")
             if k == 0:
-                axes[0, c].set_title(t, fontsize=9, color=INK)
+                axes[0, c].set_title(t, fontsize=8, color=INK)
             for a in (axes[2 * k, c], axes[2 * k + 1, c]):
                 a.set_xticks([]); a.set_yticks([])
             axes[2 * k, c].add_patch(plt.Rectangle((x0, y0), s, s, fill=False, ec="#eb6834", lw=1))
     fig.tight_layout(); fig.savefig(OUT / "stage5_renders.png"); plt.close(fig)
 
     # ---- test PSNR curve, both stages
-    fig, ax = plt.subplots(figsize=(6, 3.4), dpi=150)
-    for r, b, lab in ((run4, "torch", "Stage 4: PyTorch, 400², 100k"), (run, "gsplat", "Stage 5: gsplat, 800², 1M")):
+    fig, ax = plt.subplots(figsize=(7, 3.8), dpi=150)
+    runs = ((run4, "#9a9994", "Stage 4: PyTorch 400², 100k fixed"),
+            (runf, BACKEND["torch"][0], "Stage 5: gsplat 800², 300k fixed"),
+            (run, BACKEND["gsplat"][0], "Stage 5: gsplat 800² + densification"))
+    for r, col, lab in runs:
         ea = EventAccumulator(str(r / "tb")); ea.Reload()
         ev = ea.Scalars("test/psnr")
-        ax.plot([e.step for e in ev], [e.value for e in ev], color=BACKEND[b][0], lw=2, marker="o", ms=3, label=lab)
+        ax.plot([e.step for e in ev], [e.value for e in ev], color=col, lw=2, marker="o", ms=3, label=lab)
     ax.axhline(32, color=MUTED, lw=1, ls="--")
     ax.annotate("32 dB target", (0, 32), xytext=(4, 4), textcoords="offset points", fontsize=8, color=MUTED)
     ax.set_xlabel("iteration", color=MUTED); ax.set_ylabel("test PSNR (dB, 20 views)", color=MUTED); style(ax)
