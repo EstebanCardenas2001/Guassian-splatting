@@ -10,8 +10,8 @@ and explained before the next; this README is updated with the results of every 
 | 0 | Environment and scaffolding | ✅ |
 | 1 | 2D Gaussian image fitting | ✅ 38.56 dB @ 20k Gaussians (placeholder image) |
 | 2 | 3D forward model in pure PyTorch | ✅ 15 tests incl. gradcheck, EWA vs Monte Carlo |
-| 3 | Synthetic inverse problem | next |
-| 4 | Blender lego with my renderer | |
+| 3 | Synthetic inverse problem | ✅ exact recovery from GT+noise; 81.5 % from random init, 97.5 % with 2× Gaussians |
+| 4 | Blender lego with my renderer | next |
 | 5 | Tiled CUDA rasterizer (gsplat) | |
 | 6 | Plant data pipeline | |
 | 7 | Plant training ablations | |
@@ -247,6 +247,138 @@ Turntable (48 views):
 
 ---
 
+## Stage 3: Synthetic inverse problem
+
+Render 60 views of 200 known Gaussians, then recover them from scratch with the Stage 2
+renderer. Optimization and rendering use the same model, so the problem is exactly
+solvable; any residual error is optimization (local minima) or identifiability, never
+model mismatch. Code: [`src/synthetic.py`](src/synthetic.py) (scene, metrics),
+[`src/fit_synthetic.py`](src/fit_synthetic.py) (training),
+[`scripts/plot_stage3.py`](scripts/plot_stage3.py) (analysis).
+
+**Setup:**
+* 200 Gaussians in $[-1,1]^3$ with log-uniform anisotropic scales 0.04–0.15, uniformly
+  random rotations, opacity 0.6–0.95 and random colors.
+* 60 cameras on a Fibonacci sphere at radius 4 (every 6th held out → 50 train / 10 test),
+  160×160, white background.
+* Adam on L1 with 4 views per step for 6000 steps; exponential decay on the position
+  learning rate only.
+
+**Experiments:**
+* **A** – ground truth + noise: is the true solution a stable minimum?
+* **B** – random init, N = 200 (the task), 3 seeds.
+* **C** – random init, N = 400 (twice as many Gaussians as needed).
+* **D** – B + relocation of dead Gaussians (a test of the failure diagnosis, below), 3 seeds.
+
+### What can be identified at all
+
+Recovered Gaussians are matched to the ground truth with the Hungarian algorithm (they
+can come out in any order). Then **covariances are compared, not (q, s)**: q and −q are
+the same rotation, and swapping two axes of R together with their scales gives the same
+Σ = R S² Rᵀ. Rotation is only meaningful as the direction of the principal axes, and
+only for anisotropic Gaussians. A test checks that a perfect recovery after reordering,
+sign flips and axis swaps scores zero error, while a naive quaternion comparison calls it
+wrong by > 10°.
+
+A ground-truth Gaussian counts as **recovered** if: position error < 0.03 (≈ 1/10 of the
+mean spacing), ‖ΔΣ‖_F/‖Σ‖_F < 0.25, color RMS error < 0.1, and |Δo| < 0.1.
+
+### Results
+
+| group | runs | held-out PSNR (dB) | recovered |
+|---|---|---|---|
+| A: GT + noise | 1 | 61.38 | 100.0 % |
+| B: random, N = 200 | 3 | 34.45 ± 0.71 | 81.5 ± 1.1 % |
+| C: random, N = 400 | 1 | **60.68** | **97.5 %** |
+| D: random, N = 200 + relocation | 3 | 35.30 ± 0.38 | 86.8 ± 0.2 % |
+
+<details><summary>Per-run table</summary>
+
+| run | seed | N | test PSNR (dB) | recovered | median pos err | median Σ rel err | median axis err (anisotropy > 1.5) | median naive quat err | ms/iter |
+|---|---|---|---|---|---|---|---|---|---|
+| A | 0 | 200 | 61.38 | 100.0 % | 0.0001 | 0.007 | 0.3° | 0.5° | 44 |
+| B | 0 | 200 | 35.18 | 83.0 % | 0.0004 | 0.015 | 0.4° | 180.3° | 45 |
+| B | 1 | 200 | 34.67 | 80.5 % | 0.0005 | 0.016 | 0.5° | 180.2° | 51 |
+| B | 2 | 200 | 33.49 | 81.0 % | 0.0005 | 0.018 | 0.6° | 180.0° | 47 |
+| C | 0 | 400 | 60.68 | 97.5 % | 0.0002 | 0.007 | 0.2° | 180.1° | 50 |
+| D | 0 | 200 | 35.17 | 87.0 % | 0.0004 | 0.014 | 0.4° | 180.1° | 45 |
+| D | 1 | 200 | 35.82 | 86.5 % | 0.0004 | 0.014 | 0.4° | 180.2° | 45 |
+| D | 2 | 200 | 34.91 | 87.0 % | 0.0003 | 0.014 | 0.5° | 179.9° | 45 |
+</details>
+
+![Stage 3 curves](docs/figures/stage3_curves.png)
+
+Held-out test views (ground truth, then A–D):
+
+![Stage 3 renders](docs/figures/stage3_renders.png)
+
+Optimization from a random start (run B, held-out view; left GT, right current estimate,
+one frame per 50 iterations):
+
+![Progress B](docs/figures/stage3_progress_B.gif)
+
+### Analysis
+
+**1. The true solution is a stable minimum (A).** Starting from the ground truth with
+noise (position σ = 0.05, i.e. 1/7 of the spacing), all 200 Gaussians return: position
+error 10⁻⁴, Σ error 0.7 %, 61 dB. The gradients from Stage 2 and the parameterization
+do what they should on the full problem.
+
+**2. Rotation is identifiable only through Σ, and only for anisotropic Gaussians.** On
+the *recovered* Gaussians in B, the naive quaternion angle has a median of 180°, as if the
+rotations were random. Yet the principal-axis error is 0.4°: the optimizer found
+sign-flipped or axis-permuted (q, s) that describe the same ellipsoid. The axis error only
+becomes large (10–80°) as anisotropy → 1, where the principal axis isn't defined (right
+panel below).
+
+![Stage 3 failures](docs/figures/stage3_failures.png)
+
+**3. Failures from a random start are local minima, concentrated on barely visible
+Gaussians.** About 18 % of the ground-truth Gaussians are not recovered, consistently
+across seeds. The failure rate is **36 % in the least-visible quarter vs 11 % for the
+rest** (left panel). Visibility is measured exactly: rendering with `colors = I₂₀₀`
+gives each Gaussian's compositing weight $T_k\alpha_k$ per pixel in a single pass. The
+renders barely show the failures (B looks nearly like the ground truth at 35 dB),
+because the unrecovered Gaussians are the ones that contribute little to the images.
+Too few Gaussians had colors near the white background (4) to test the color/background
+ambiguity.
+
+![Stage 3 top view](docs/figures/stage3_matches_topview.png)
+
+**4. Diagnosis, tested twice: one hypothesis partly confirmed, one falsified.**
+* *Dead Gaussians.* In B, 19 recovered Gaussians end transparent (opacity < 0.05) while
+  25 ground-truth Gaussians have no recovered Gaussian within 0.1. The gradient of a
+  splat's contribution scales with its opacity, so a Gaussian that fades early can't
+  travel. **Test (D):** every 500 steps, move dead Gaussians onto live ones, sampled in
+  proportion to opacity (3DGS-MCMC-style, splitting opacity as $o' = 1-(1-o)^{1/(k+1)}$
+  so the stack keeps the same α, and resetting Adam's moments). Recovery rises from
+  81.5 % to 86.8 % on all 3 seeds, but PSNR only by +0.85 dB, so this is only part of
+  the story.
+* *Compromise Gaussians.* 33 of 34 unrecovered ground-truth Gaussians in B lie inside the
+  3σ ellipsoid of a live recovered Gaussian of normal size (only 4 of those are
+  oversized). One splat sits between two targets and serves both. I expected these to
+  have large per-view gradients that cancel in the sum, the signal 3DGS uses to decide
+  where to densify. **That is false at convergence:** their mean per-view screen-space
+  gradient is 0.8× that of the other Gaussians, and none is in the top 10 %. Their net
+  gradient is 3× smaller: they sit at a genuine stationary point.
+
+![Stage 3 gradients](docs/figures/stage3_gradients.png)
+
+**5. Spare capacity is what works (C).** With 400 Gaussians for 200 targets, 97.5 % are
+recovered and held-out PSNR reaches 60.7 dB, close to A. About half of the 400 end up
+transparent (207 live): the extra Gaussians let the optimizer explore and then switch off
+the losers instead of committing to compromises. Consequences for the real pipeline:
+* Use more Gaussians than strictly needed, which is what densification (Stage 7C) and
+  dense SfM initialization provide.
+* Grow them *during* training, when the errors are still large, rather than trying to
+  repair a converged state.
+* Prune transparent ones.
+
+Whether the densification statistic flags compromises *during* training (rather than at
+convergence) is an open question carried into Stage 7.
+
+---
+
 ## Repository layout
 
 ```
@@ -255,8 +387,9 @@ data/      -> /mnt/data      (raw photos, masks, COLMAP, nerf_synthetic; not in 
 outputs/   -> /mnt/outputs   (runs; not in git)
 docs/figures/                figures embedded in this README
 scripts/      setup_env.sh, check_env.py, gpu_bench.py, gsplat_smoke.py, tensorboard.sh,
-              stage1_sweep.sh, plot_stage1.py, stage2_scene.py
+              stage1_sweep.sh, plot_stage1.py, stage2_scene.py, stage3_sweep.sh,
+              plot_stage3.py
 src/          config.py, run.py, splat2d.py, fit2d.py, rasterize.py, gaussians.py,
-              camera.py, render_torch.py, and stubs for later stages
+              camera.py, render_torch.py, synthetic.py, fit_synthetic.py, and stubs for later stages
 tests/        pytest suite
 ```

@@ -1,0 +1,39 @@
+_base_: base.yaml
+name: stage3_synthetic
+
+scene:
+  n_gt: 200
+  seed: 0            # ground-truth scene seed (kept fixed across experiments)
+  extent: 1.0        # means in [-extent, extent]^3
+  scale_range: [0.04, 0.15]
+  opacity_range: [0.6, 0.95]
+
+cameras:
+  n: 60              # Fibonacci sphere; every 6th view held out -> 50 train / 10 test
+  test_every: 6
+  radius: 4.0
+  fov_deg: 50
+  width: 160
+  height: 160
+  bg: [1.0, 1.0, 1.0]
+
+init:
+  mode: random       # random | gt_perturbed
+  n: 200             # number of Gaussians to optimize (random mode)
+  opacity: 0.1
+  perturb: {means: 0.05, log_scales: 0.2, quats: 0.2, opacity_logits: 0.5, color_logits: 0.5}
+
+train:
+  iterations: 6000
+  views_per_iter: 4
+  loss: l1           # l1 | l2
+  lr:
+    means: 0.01
+    quats: 0.005
+    log_scales: 0.01
+    opacity_logits: 0.05
+    color_logits: 0.01
+  means_lr_final_factor: 0.01   # exponential decay on the position learning rate only
+  eval_every: 100
+  params_every: 500
+  gif_every: 50

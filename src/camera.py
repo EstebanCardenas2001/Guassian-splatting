@@ -91,3 +91,27 @@ def orbit_cameras(n: int, radius: float, elevation_deg: float, fov_deg: float, W
             dtype=dtype, device=device)
         cams.append(Camera(look_at(eye, target, up), K.clone(), W, H, name=f"orbit_{i:03d}"))
     return cams
+
+
+def sphere_cameras(n: int, radius: float, fov_deg: float, W: int, H: int,
+                   target: Tensor | None = None, seed: int = 0,
+                   dtype=torch.float32, device="cpu") -> list[Camera]:
+    """``n`` cameras on a sphere around ``target`` (Fibonacci lattice, randomly rotated by
+    ``seed`` about the y axis), all looking at it. Near the poles, where the world +y
+    "up" is parallel to the viewing direction, +z is used as the up hint instead."""
+    target = torch.zeros(3, dtype=dtype, device=device) if target is None else target
+    f = focal_from_fov(math.radians(fov_deg), W)
+    K = intrinsics_matrix(f, f, W / 2, H / 2).to(dtype=dtype, device=device)
+    phase = 2 * math.pi * torch.rand(1, generator=torch.Generator().manual_seed(seed)).item()
+    golden = math.pi * (3 - math.sqrt(5))
+    cams = []
+    for i in range(n):
+        y = 1 - 2 * (i + 0.5) / n
+        r = math.sqrt(1 - y * y)
+        a = golden * i + phase
+        d = torch.tensor([r * math.cos(a), y, r * math.sin(a)], dtype=dtype, device=device)
+        up = torch.tensor([0.0, 1.0, 0.0] if abs(y) < 0.95 else [0.0, 0.0, 1.0],
+                          dtype=dtype, device=device)
+        cams.append(Camera(look_at(target + radius * d, target, up), K.clone(), W, H,
+                           name=f"sphere_{i:03d}"))
+    return cams

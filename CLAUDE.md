@@ -60,6 +60,7 @@ scripts/            setup_env.sh, check_env.py, gpu_bench.py, tensorboard.sh, st
 src/
   splat2d.py, fit2d.py  Stage 1 2D renderer + fitting
   rasterize.py      shared sparse depth-sorted compositing (2D Gaussians -> image)
+  synthetic.py, fit_synthetic.py  Stage 3 GT scenes, recovery metrics, inverse problem
   config.py         YAML loading (+ _base_ inheritance, dotlist overrides)
   run.py            seeding, git provenance, run directories, metrics.json
   camera.py         intrinsics/extrinsics, COLMAP + Blender loaders
