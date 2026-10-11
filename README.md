@@ -12,7 +12,7 @@ and explained before the next; this README is updated with the results of every 
 | 2 | 3D forward model in pure PyTorch | ✅ 15 tests incl. gradcheck, EWA vs Monte Carlo |
 | 3 | Synthetic inverse problem | ✅ exact recovery from GT+noise; 81.5 % from random init, 97.5 % with 2× Gaussians |
 | 4 | Blender lego with my renderer | ✅ 27.88 dB at 400² (no densification); breaks at ~80 M pairs / 10 h per run at 800² |
-| 5 | Tiled CUDA rasterizer (gsplat) | ✅ 32.96 dB at 800² with gsplat's reference densification; my own densification next |
+| 5 | Tiled CUDA rasterizer (gsplat) | ✅ 34.15 dB at 800² with my own densification (gsplat's reference: 32.96) |
 | 6 | Plant data pipeline | |
 | 7 | Plant training ablations | |
 | 8 | Pushing the T4 to maximum detail | |
@@ -586,8 +586,63 @@ alpha mask:
 
 Hooked into my loop (one Adam per tensor, called after the optimizer step as in gsplat's
 reference trainer), it first pruned the 100k random Gaussians to ~43k, then grew them to
-360k where detail was missing, and passed 32 dB at ~12k iterations. This run is the
-reference that my own `densify.py` (next step) has to match.
+360k where detail was missing, and passed 32 dB at ~12k iterations.
+
+### My own adaptive density control
+
+[`src/densify.py`](src/densify.py) implements the same rules myself, with the same interface
+so the trainer can swap the two. The statistic is the view-space positional gradient,
+averaged over the views where a Gaussian is visible, converted from pixels to NDC by the
+chain rule ($\partial L/\partial x_\text{ndc} = \tfrac{W}{2}\,\partial L/\partial u$):
+
+$$g_k = \frac{1}{n_k}\sum_{v} \big\lVert \nabla_{\mu'_k} L_v \big\rVert_\text{NDC} > \tau = 2\cdot 10^{-4}
+\;\Rightarrow\;\begin{cases}\text{clone} & \max s_k \le 0.01\,r_\text{scene}\\
+\text{split into 2},\ \mu' = \mu + R\,\mathrm{diag}(s)\,\varepsilon,\ s' = s/1.6 & \text{otherwise}\end{cases}$$
+
+Prune when $o < 0.005$ (or $\max s > 0.1\,r_\text{scene}$ after the first reset). Every
+3000 steps apply the **opacity reset** $o \leftarrow \min(o, 0.01)$. New Gaussians get zero
+Adam moments.
+
+**Verification:**
+* On a state where clone, split and prune all trigger, my ADC gives **bit-identical
+  parameters and Adam moments** to gsplat's `DefaultStrategy` under the same RNG seed, at a
+  step before and after the first reset period.
+* A lockstep diagnostic ([`scripts/adc_lockstep.py`](scripts/adc_lockstep.py)) applies both
+  to cloned states inside a real training run: identical at every refinement through
+  6000 steps.
+* Split children follow $\mathcal N(\mu, \Sigma)$ (empirical covariance of 40k children),
+  and the reset caps opacity and zeroes its moments.
+
+**A bug in gsplat 1.5.3.** `DefaultStrategy` gates the reset with
+`if step % self.reset_every == 0 & step > 0:`. Python reads that as the chained comparison
+`(step % reset_every) == (0 & step) > 0`, i.e. `... and 0 > 0`, which is **always False**: the
+opacity reset never runs (checked empirically: opacities stay at 0.95 at step 3000). So
+gsplat's reference is really "3DGS without opacity reset", and `densify.py` has an
+`opacity_reset` switch to reproduce either.
+
+| densification (lego 800², 30k it.) | runs | final Gaussians | test PSNR (200 views) | SSIM | time |
+|---|---|---|---|---|---|
+| gsplat `DefaultStrategy` (reset never fires) | 2 | 360k, 355k | 32.96, 32.80 | 0.977, 0.977 | 16 min |
+| my ADC, reset off | 2 | **920k**, 362k | 32.47, 32.61 | 0.973, 0.976 | 17 min |
+| **my ADC, reset on (3DGS paper)** | 2 | 289k, 291k | **34.15, 33.89** | **0.979, 0.978** | 15 min |
+
+* **The opacity reset is worth +1.3 dB with 20 % fewer Gaussians.** It removes floaters and
+  redundant Gaussians: those that don't win their opacity back are pruned.
+* **Without it, growth is unstable.** Four of the reset-off runs (gsplat's and mine) end at
+  355–362k, but one of mine ran away to 920k with *lower* PSNR. Since the two
+  implementations make identical decisions from identical states, that is run-to-run
+  randomness (non-deterministic GPU accumulation) amplified by densification's positive
+  feedback. Both reset-on runs end within 1 % of each other.
+* For reference, 3DGS reports 35.8 dB on lego with spherical harmonics (view-dependent
+  color), which comes in Stage 7D; these runs use plain RGB.
+
+![Densification runs](docs/figures/stage5_densify_runs.png)
+
+*Right: test PSNR collapses at each reset step (all opacities capped at 0.01 when the
+evaluation happens) and recovers within a few hundred iterations.*
+
+Renders below: ground truth, Stage 4 (pure PyTorch, 400², fixed set), Stage 5 fixed set,
+and my ADC with reset (34.15 dB).
 
 ![Lego renders](docs/figures/stage5_renders.png)
 
@@ -605,10 +660,10 @@ docs/figures/                figures embedded in this README
 scripts/      setup_env.sh, check_env.py, gpu_bench.py, gsplat_smoke.py, tensorboard.sh,
               stage1_sweep.sh, plot_stage1.py, stage2_scene.py, stage3_sweep.sh,
               plot_stage3.py, profile_torch_renderer.py, plot_stage4.py,
-              stage5_agreement.py, plot_stage5.py
+              stage5_agreement.py, plot_stage5.py, adc_lockstep.py
 src/          config.py, run.py, splat2d.py, fit2d.py, rasterize.py, gaussians.py,
               camera.py, render_torch.py, render_gsplat.py, synthetic.py, fit_synthetic.py,
-              losses.py, train.py,
+              losses.py, densify.py, train.py,
               and stubs for later stages
 tests/        pytest suite
 ```

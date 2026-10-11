@@ -101,5 +101,32 @@ def main():
     print(f"figures -> {OUT}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--densify-runs" not in __import__("sys").argv:
     main()
+
+
+def plot_densify_runs():
+    """Gaussian count and test PSNR over training for every densified lego run."""
+    groups = {"gsplat DefaultStrategy (no reset)": ("#9a9994", ["stage5_lego_gsplat_densify", "stage5_lego_gsplat_densify_rep"]),
+              "my ADC, reset off": ("#eb6834", ["stage5_lego_adc_noreset", "stage5_lego_adc_noreset_rep"]),
+              "my ADC, reset on (3DGS)": ("#2a78d6", ["stage5_lego_adc", "stage5_lego_adc_rep"])}
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), dpi=150)
+    for lab, (col, names) in groups.items():
+        for j, n in enumerate(names):
+            ea = EventAccumulator(str(ROOT / "outputs" / f"2026-10-11_{n}" / "tb"), size_guidance={"scalars": 0}); ea.Reload()
+            g = ea.Scalars("model/n_gaussians"); p = ea.Scalars("test/psnr")
+            kw = dict(color=col, lw=1.8, ls="-" if j == 0 else "--", label=lab if j == 0 else None)
+            axes[0].plot([e.step for e in g], [e.value / 1e3 for e in g], **kw)
+            axes[1].plot([e.step for e in p], [e.value for e in p], **kw)
+    for x in range(3000, 15001, 3000):
+        axes[0].axvline(x, color=GRID, lw=0.8, zorder=0)
+    axes[0].set_ylabel("Gaussians (thousands)", color=MUTED); axes[1].set_ylabel("test PSNR (dB, 20 views)", color=MUTED)
+    axes[1].set_ylim(26, 34.8)
+    for ax in axes:
+        ax.set_xlabel("iteration", color=MUTED); style(ax)
+    axes[0].legend(frameon=False, fontsize=8, title="solid / dashed = two runs", title_fontsize=7)
+    fig.tight_layout(); fig.savefig(OUT / "stage5_densify_runs.png"); plt.close(fig)
+
+
+if __name__ == "__main__" and "--densify-runs" in __import__("sys").argv:
+    plot_densify_runs()
