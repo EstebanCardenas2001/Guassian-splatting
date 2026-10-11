@@ -46,70 +46,28 @@ catastrophic cancellation (in float32 the subtraction would lose ~0.1 in log T).
 """
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import Tensor
 
-ALPHA_MAX = 0.99   # clamp so log(1 - alpha) stays finite and every layer lets some light through
-Q_CUTOFF = 9.0     # 3-sigma ellipse
+from src.rasterize import ALPHA_MAX, Q_CUTOFF, rasterize
 
 
-def screen_radius(scales: Tensor) -> Tensor:
-    """Integer half-width (pixels) of the box that contains the 3-sigma ellipse. (N,) int64.
+def conics_from_rotation(theta: Tensor, scales: Tensor) -> Tensor:
+    """Upper triangle (A, B, C) of Sigma^{-1} = R diag(1/s1^2, 1/s2^2) R^T. (N, 3).
 
-    Pixel indices ``floor(mu) +- r`` with ``r = ceil(3 max(s1, s2))`` contain every pixel
-    center within 3*max(s) of mu (proof: |j + 0.5 - mu| <= 3s  =>  |j - floor(mu)| <= ceil(3s)).
+    With c = cos(theta), s = sin(theta), R = [[c, -s], [s, c]]:
+        A = c^2/s1^2 + s^2/s2^2,  B = c s (1/s1^2 - 1/s2^2),  C = s^2/s1^2 + c^2/s2^2.
     """
-    return torch.ceil(3.0 * scales.detach().amax(dim=-1)).long()
-
-
-def enumerate_pairs(means: Tensor, theta: Tensor, scales: Tensor, H: int, W: int,
-                    max_radius: int = 64, max_pairs: int = 60_000_000,
-                    sort_by_pixel: bool = False) -> tuple[Tensor, Tensor, Tensor]:
-    """Integer (Gaussian, pixel) pairs with q < 9. No autograd; returns (gid, px, py), each (P,).
-
-    means (N, 2) px, theta (N,), scales (N, 2) px. Box radius is clamped to ``max_radius``
-    (a very large Gaussian is truncated - its gradients then ignore the cut-off part).
-    With ``sort_by_pixel`` the pairs are ordered by (pixel, Gaussian index), i.e. per pixel
-    front-to-back. Sorting the integers here, before any differentiable computation, keeps
-    the permutation out of the autograd graph.
-    """
-    N = means.shape[0]
-    dev = means.device
-    means, theta, scales = means.detach(), theta.detach(), scales.detach()
-    with torch.no_grad():
-        r = screen_radius(scales).clamp(max=max_radius)
-        side = 2 * r + 1
-        counts = side * side
-        total = int(counts.sum())
-        if total > max_pairs:
-            raise RuntimeError(f"{total:,} candidate pairs exceeds max_pairs={max_pairs:,}; "
-                               "Gaussians are too large (lower max_radius or regularize scales)")
-        gid = torch.repeat_interleave(torch.arange(N, device=dev), counts, output_size=total)
-        start = torch.cumsum(counts, 0) - counts
-        k = torch.arange(total, device=dev) - start[gid]
-        s, rr = side[gid], r[gid]
-        center = torch.floor(means).long()
-        px = center[gid, 0] + (k % s) - rr
-        py = center[gid, 1] + (k // s) - rr
-        ok = (px >= 0) & (px < W) & (py >= 0) & (py < H)
-        gid, px, py = gid[ok], px[ok], py[ok]
-        q = _mahalanobis_sq(px, py, means[gid, 0], means[gid, 1], theta[gid],
-                            scales[gid, 0], scales[gid, 1])
-        ok = q < Q_CUTOFF
-        gid, px, py = gid[ok], px[ok], py[ok]
-        if sort_by_pixel:
-            order = torch.argsort((py * W + px) * N + gid)
-            gid, px, py = gid[order], px[order], py[order]
-    return gid, px, py
+    c, s = torch.cos(theta), torch.sin(theta)
+    i1, i2 = scales[:, 0] ** -2, scales[:, 1] ** -2
+    return torch.stack([c * c * i1 + s * s * i2, c * s * (i1 - i2), s * s * i1 + c * c * i2], -1)
 
 
 def _mahalanobis_sq(px: Tensor, py: Tensor, mx: Tensor, my: Tensor, theta: Tensor,
                     s1: Tensor, s2: Tensor) -> Tensor:
     """q = (u/s1)^2 + (v/s2)^2 with (u, v) = R(theta)^T (p - mu), p the pixel center.
 
-    All arguments are per pair, shape (P,).
+    Independent of the conic form; used by the dense reference.
     """
     dx = px.to(mx.dtype) + 0.5 - mx
     dy = py.to(my.dtype) + 0.5 - my
@@ -119,20 +77,10 @@ def _mahalanobis_sq(px: Tensor, py: Tensor, mx: Tensor, my: Tensor, theta: Tenso
     return (u / s1) ** 2 + (v / s2) ** 2
 
 
-def _gather(gid: Tensor, means, theta, scales, colors, opacities) -> Tensor:
-    """Per-pair copy of all Gaussian parameters, (P, 9): mx, my, theta, s1, s2, r, g, b, o.
-
-    One ``index_select`` on a packed (N, 9) tensor: its backward is a single atomic
-    ``index_add``, much cheaper than the sort-based backward of several ``x[gid]`` gathers.
-    """
-    packed = torch.cat([means, theta[:, None], scales, colors, opacities[:, None]], dim=1)
-    return packed.index_select(0, gid)
-
-
 def render(means: Tensor, theta: Tensor, scales: Tensor, colors: Tensor, opacities: Tensor,
            H: int, W: int, mode: str = "alpha", bg: Tensor | None = None,
-           t_min: float = 1e-4, max_radius: int = 64) -> tuple[Tensor, dict]:
-    """Render N 2D Gaussians to an (H, W, 3) image.
+           t_min: float = 1e-4, max_radius: float = 64.0) -> tuple[Tensor, dict]:
+    """Render N 2D Gaussians to an (H, W, 3) image via :func:`src.rasterize.rasterize`.
 
     Args:
         means (N, 2), theta (N,), scales (N, 2) > 0, colors (N, 3), opacities (N,) in (0, 1):
@@ -140,55 +88,14 @@ def render(means: Tensor, theta: Tensor, scales: Tensor, colors: Tensor, opaciti
         mode: "additive" or "alpha" (front-to-back in index order, Gaussian 0 in front).
         bg: (3,) background color for alpha mode (default black).
         t_min: early-termination threshold on transmittance (alpha mode); 0 disables it.
+        max_radius: cap (pixels) on the 3-sigma extent; larger Gaussians are truncated.
     Returns:
         image (H, W, 3) in the parameters' dtype, and stats {"pairs": P}.
     """
-    if mode not in ("additive", "alpha"):
-        raise ValueError(f"unknown mode {mode!r}")
-    gid, px, py = enumerate_pairs(means, theta, scales, H, W, max_radius=max_radius,
-                                  sort_by_pixel=(mode == "alpha"))
-    pix = py * W + px
-    g = _gather(gid, means, theta, scales, colors, opacities)
-    q = _mahalanobis_sq(px, py, g[:, 0], g[:, 1], g[:, 2], g[:, 3], g[:, 4])
-    w = g[:, 8] * torch.exp(-0.5 * q)
-    rgb = g[:, 5:8]
-    out = means.new_zeros(H * W, 3)
-
-    if mode == "additive":
-        out = out.index_add(0, pix, w[:, None] * rgb)
-        return out.view(H, W, 3), {"pairs": pix.numel()}
-
-    # Pairs are already sorted by (pixel, depth); depth order == Gaussian index.
-    alpha = w.clamp(max=ALPHA_MAX)
-
-    # Segmented exclusive cumsum of log(1 - alpha) per pixel, in float64.
-    L = torch.log1p(-alpha.double())
-    incl = torch.cumsum(L, 0)
-    excl = incl - L
-    is_start = torch.ones_like(pix, dtype=torch.bool)
-    is_start[1:] = pix[1:] != pix[:-1]
-    seg = torch.cumsum(is_start.long(), 0) - 1               # segment id for each pair
-    start_idx = torch.nonzero(is_start).squeeze(1)
-    log_T = excl - excl.index_select(0, start_idx).index_select(0, seg)   # exclusive, per pixel
-
-    # Early termination: keep k iff T_k (1 - alpha_k) >= t_min. T is non-increasing along a
-    # segment, so this keeps a prefix of each pixel's list - exactly the sequential rule.
-    if t_min > 0:
-        keep = (log_T + L).detach() >= math.log(t_min)
-    else:
-        keep = torch.ones_like(L, dtype=torch.bool)
-
-    T = torch.exp(log_T).to(alpha.dtype)
-    contrib = torch.where(keep, T * alpha, 0.0)
-    out = out.index_add(0, pix, contrib[:, None] * rgb)
-
-    # Final transmittance per pixel: exp(sum of kept log(1 - alpha)); 1 where nothing landed.
-    log_T_final = torch.zeros(H * W, dtype=L.dtype, device=L.device)
-    log_T_final = log_T_final.index_add(0, pix, torch.where(keep, L, 0.0))
-    T_final = torch.exp(log_T_final).to(alpha.dtype)
-    bg = means.new_zeros(3) if bg is None else bg.to(means)
-    out = out + T_final[:, None] * bg
-    return out.view(H, W, 3), {"pairs": pix.numel()}
+    radii = (3.0 * scales.detach().amax(-1)).clamp(max=max_radius)
+    img, _, info = rasterize(means, conics_from_rotation(theta, scales), radii, colors,
+                             opacities, H, W, depths=None, bg=bg, mode=mode, t_min=t_min)
+    return img, info
 
 
 def render_dense(means: Tensor, theta: Tensor, scales: Tensor, colors: Tensor,

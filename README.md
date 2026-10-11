@@ -9,8 +9,8 @@ and explained before the next; this README is updated with the results of every 
 |---|---|---|
 | 0 | Environment and scaffolding | ✅ |
 | 1 | 2D Gaussian image fitting | ✅ 38.56 dB @ 20k Gaussians (placeholder image) |
-| 2 | 3D forward model in pure PyTorch | in progress |
-| 3 | Synthetic inverse problem | |
+| 2 | 3D forward model in pure PyTorch | ✅ 15 tests incl. gradcheck, EWA vs Monte Carlo |
+| 3 | Synthetic inverse problem | next |
 | 4 | Blender lego with my renderer | |
 | 5 | Tiled CUDA rasterizer (gsplat) | |
 | 6 | Plant data pipeline | |
@@ -152,6 +152,101 @@ Additive renders, for comparison:
 
 ---
 
+## Stage 2: 3D forward model in pure PyTorch
+
+Code: [`src/gaussians.py`](src/gaussians.py) (quaternion → rotation, covariance),
+[`src/camera.py`](src/camera.py) (conventions, `look_at`, orbits),
+[`src/render_torch.py`](src/render_torch.py) (projection, EWA, culling),
+[`src/rasterize.py`](src/rasterize.py) (depth-sorted compositing, shared with Stage 1).
+Tests: [`tests/test_render_torch.py`](tests/test_render_torch.py).
+
+### Conventions
+
+* Camera frame as in COLMAP/OpenCV/gsplat: **x right, y down, z forward**.
+* `viewmat` = world→camera `[[R, t], [0, 1]]` acting on column vectors:
+  $x_\text{cam} = R\,x_\text{world} + t$ (row-stacked points: `X @ R.T + t`).
+* Pixel coordinates: origin at the top-left *corner*; pixel (i, j) is sampled at (j + ½, i + ½).
+* Quaternions are `(w, x, y, z)`, stored unnormalized and normalized on use.
+
+### Model
+
+$$\Sigma = R\,S\,S^\top R^\top,\qquad R = R(q/\lVert q\rVert),\quad S = \mathrm{diag}(e^{\ell_1}, e^{\ell_2}, e^{\ell_3})$$
+
+so Σ stays symmetric positive semi-definite under any gradient step. A Gaussian at
+camera-space position $t = (t_x, t_y, t_z)$ projects to $u = f_x t_x/t_z + c_x$,
+$v = f_y t_y/t_z + c_y$. EWA linearizes the perspective map at $t$:
+
+$$\Sigma' = J\,R_{wc}\,\Sigma\,R_{wc}^\top J^\top + 0.3\,I,\qquad
+J = \begin{pmatrix} f_x/t_z & 0 & -f_x t_x/t_z^2\\ 0 & f_y/t_z & -f_y t_y/t_z^2\end{pmatrix}$$
+
+$t_x/t_z$ and $t_y/t_z$ are clamped to 1.3× the field of view before building $J$ (as in
+3DGS/gsplat). The 0.3 px² dilation keeps every splat at least about one pixel wide. An
+optional antialiased mode multiplies opacity by
+$\sqrt{\det(\Sigma'-0.3I)/\det\Sigma'}$ (Mip-Splatting), which conserves energy instead.
+
+**Culling:** near < $t_z$ < far, positive-definite Σ′, and the 3σ box must overlap the
+image. Culled Gaussians get placeholder depths, so no `0·inf = NaN` can leak into the
+backward pass. **Compositing:** per pixel front to back by camera depth of the
+Gaussian center, $\alpha=\min(0.99, o\,e^{-q/2})$, skip $\alpha<1/255$, early
+termination at $T<10^{-4}$.
+
+### Verification (15 tests, all passing)
+
+| Test | What it checks |
+|---|---|
+| quaternion → R | identity, +90° about z, invariance to scale and sign, orthonormal with det = +1 |
+| covariance | eigenvalues of Σ equal the squared scales |
+| `look_at` | OpenCV axes, proper rotation; world +y up appears at the top of the image |
+| pinhole | on-axis point → principal point; off-axis values by hand |
+| **EWA vs autograd** | $J R_{wc}$ equals `torch.autograd.functional.jacobian` of the real world→pixel map (1e-10) |
+| **EWA vs Monte Carlo** | covariance of 400k projected samples matches Σ′ (2 %) |
+| culling | behind camera, inside near plane, far outside frustum → radius 0; empty image = bg |
+| compositing | center pixel = $o\,c + (1-o)\,\text{bg}$; the front Gaussian wins whatever the index order |
+| sparse = dense | sparse renderer vs brute-force O(N·HW) compositing (1e-10), with and without the 1/255 skip |
+| multi-view | a small Gaussian's brightest pixel contains $K[R\,|\,t]P$ (computed by hand) from 4 viewpoints |
+| antialiased | opacity compensation ≈ 1 for large splats, ≪ 1 for sub-pixel ones |
+| **gradcheck** | float64 gradients w.r.t. means, quaternions, scales, opacities, colors |
+
+### Visual check: hand-placed scene from several views
+
+29 hand-placed Gaussians: coordinate axes (+x red, +y green, +z blue), a thin disk tilted
+45° about x, and a ring of anisotropic Gaussians
+([`scripts/stage2_scene.py`](scripts/stage2_scene.py)).
+
+![Multi-view renders](docs/figures/stage2_multiview.png)
+
+The geometry matches what you'd predict by hand:
+
+* At azimuth 0° the camera sits on −z looking toward +z, so **+x points left** (right-handed
+  world) and +z points away, foreshortened to a dot. At 180° +x points right and +z comes
+  toward the camera.
+* The disk's normal (0, −0.71, 0.71) predicts face-on at 0° (n·d = −0.9), oblique at
+  180° (0.42) and **almost edge-on at 120°/240°** (±0.09), which is what the renders show.
+* Near ring segments are larger and cover the disk and the far segments (depth sorting).
+
+Projected 3σ footprints from the EWA covariance, drawn over the render:
+
+![EWA footprints](docs/figures/stage2_footprints.png)
+
+Turntable (48 views):
+
+![Turntable](docs/figures/stage2_turntable.gif)
+
+### Observations
+
+1. **Every step can be checked against something independent:** the Jacobian against
+   autograd, the linearization against Monte Carlo, and the whole pipeline against
+   `gradcheck`. All 15 tests passed on the first run after one handedness bug in my own
+   *test* (I had expected +x on the right).
+2. **The NaN trap:** a Gaussian behind the camera has $t_z \le 0$, and masking its output
+   is not enough, because `where` passes a zero gradient into an `inf`, which gives `NaN`.
+   Replacing its depth with a safe placeholder before the projection fixes it.
+3. **Pure PyTorch costs about 48 ms for 29 Gaussians at 480×360.** It is dominated by the
+   large splats (the disk covers most of the frame) and kernel-launch overhead. Stage 4
+   will profile where this breaks down at scale.
+
+---
+
 ## Repository layout
 
 ```
@@ -160,7 +255,8 @@ data/      -> /mnt/data      (raw photos, masks, COLMAP, nerf_synthetic; not in 
 outputs/   -> /mnt/outputs   (runs; not in git)
 docs/figures/                figures embedded in this README
 scripts/      setup_env.sh, check_env.py, gpu_bench.py, gsplat_smoke.py, tensorboard.sh,
-              stage1_sweep.sh, plot_stage1.py
-src/          config.py, run.py, splat2d.py, fit2d.py, and stubs for the 3D pipeline
+              stage1_sweep.sh, plot_stage1.py, stage2_scene.py
+src/          config.py, run.py, splat2d.py, fit2d.py, rasterize.py, gaussians.py,
+              camera.py, render_torch.py, and stubs for later stages
 tests/        pytest suite
 ```

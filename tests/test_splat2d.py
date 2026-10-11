@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-from src.splat2d import render, render_dense, screen_radius
+from src.splat2d import render, render_dense
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -36,11 +36,6 @@ def test_single_gaussian_peak_and_axes():
     # rotating by 90 degrees swaps the axes
     img90, _ = render(means, theta + math.pi / 2, scales, colors, opac, H, W, mode="additive")
     assert torch.allclose(img90, img.transpose(0, 1))
-
-
-def test_radius_contains_ellipse():
-    scales = torch.tensor([[0.3, 0.3], [2.5, 1.0], [10.0, 0.5]])
-    assert screen_radius(scales).tolist() == [1, 8, 30]
 
 
 @pytest.mark.parametrize("mode", ["additive", "alpha"])
