@@ -1,0 +1,6 @@
+_base_: stage5_lego_gsplat_densify.yaml
+name: stage5_lego_adc
+
+densify:
+  strategy: adc             # my implementation, src/densify.py
+  opacity_reset: true       # as in the 3DGS paper (gsplat 1.5.3 never resets)

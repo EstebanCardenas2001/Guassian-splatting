@@ -41,13 +41,17 @@ def make_strategy(cfg, train_cams):
     d = cfg.get("densify", {"strategy": "none"})
     if d["strategy"] == "none":
         return None, None
-    if d["strategy"] != "gsplat_default":
-        raise ValueError(d["strategy"])
     if cfg.render.backend != "gsplat":
-        raise ValueError("gsplat strategies need the gsplat backend's meta")
-    from gsplat.strategy import DefaultStrategy
+        raise ValueError("densification needs the gsplat backend's meta (screen-space means)")
     kw = {k: v for k, v in d.items() if k not in ("strategy", "scene_scale")}
-    strategy = DefaultStrategy(**kw)
+    if d["strategy"] == "gsplat_default":           # reference implementation
+        from gsplat.strategy import DefaultStrategy
+        strategy = DefaultStrategy(**kw)
+    elif d["strategy"] == "adc":                    # my implementation (src/densify.py)
+        from src.densify import ADC
+        strategy = ADC(**kw)
+    else:
+        raise ValueError(d["strategy"])
     centers = torch.stack([c.center for c in train_cams])
     scene_scale = d.get("scene_scale") or float(1.1 * (centers - centers.mean(0)).norm(dim=-1).max())
     return strategy, strategy.initialize_state(scene_scale=scene_scale)
