@@ -1,0 +1,5 @@
+# Defaults shared by every experiment. Child configs set `_base_: base.yaml`.
+name: base
+seed: 0
+output_root: outputs
+device: cuda

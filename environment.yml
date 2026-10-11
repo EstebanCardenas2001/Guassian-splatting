@@ -1,0 +1,15 @@
+name: gsplat
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - cuda-nvcc=12.6
+  - cuda-cudart-dev=12.6
+  - cuda-libraries-dev=12.6
+  - gxx_linux-64=13
+  - gcc_linux-64=13
+  - ninja
+  - ffmpeg
+# torch, torchvision and gsplat are installed with pip by scripts/setup_env.sh
+# (CUDA 12.6 wheel index; gsplat built with --no-build-isolation).

@@ -1,0 +1,17 @@
+numpy
+scipy
+pyyaml
+omegaconf
+tensorboard
+pytest
+matplotlib
+imageio[ffmpeg]
+opencv-python-headless
+tqdm
+plyfile
+torchmetrics
+lpips
+pycolmap
+viser
+jupyterlab
+rembg[gpu]
