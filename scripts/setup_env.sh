@@ -22,12 +22,14 @@ if [ ! -x $CONDA_DIR/bin/conda ]; then
   $CONDA_DIR/bin/conda init bash
 fi
 source $CONDA_DIR/etc/profile.d/conda.sh
+# conda activate.d scripts (e.g. cuda-nvcc) reference unset vars; relax -u around them.
+activate() { set +u; conda activate "$1"; set -u; }
 
 # 2. Env with Python 3.12, nvcc 12.6 and a gcc that nvcc 12.6 accepts (<=13)
 if ! conda env list | grep -q "^$ENV "; then
   conda env create -f $REPO/environment.yml
 fi
-conda activate $ENV
+activate $ENV
 
 # Env vars applied on every `conda activate gsplat`
 mkdir -p $CONDA_PREFIX/etc/conda/activate.d
@@ -40,7 +42,7 @@ export PIP_CACHE_DIR=$BASE/cache/pip
 export TORCH_HOME=$BASE/cache/torch
 export TORCH_EXTENSIONS_DIR=$BASE/cache/torch_extensions
 EOF
-conda deactivate; conda activate $ENV
+set +u; conda deactivate; set -u; activate $ENV
 
 # 3. PyTorch (CUDA 12.6 wheels)
 pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
