@@ -12,6 +12,10 @@ and **final quality** (sharp leaf edges, thin stems, terracotta texture, view-de
 - CloudVeneto VM, headless Ubuntu 26.04. Visuals go to files or SSH port forwards (TensorBoard 6006, Jupyter, viser).
 - Tesla T4: 15 GB, sm_75, ~8 TFLOPS FP32, FP16 tensor cores, **no bf16**. Driver 580.178.04 (CUDA ≤ 13.0).
 - 15 CPU cores, 88 GiB RAM, no swap.
+- Measured (`scripts/gpu_bench.py`, sustained): the T4 is **power-capped at 70 W** (also the max allowed limit).
+  Dense matmul drops SM clock 1590 → 690–870 MHz: FP32 4.3 TFLOPS, FP16 tensor cores 25 TFLOPS.
+  Memory-bound kernels stay at 1590 MHz, 232 GB/s device copy. Thermals are fine (< 50 °C). ECC is on.
+  Splatting is bandwidth/launch-bound, so the lever is keeping the GPU fed, not clocks.
 - **Disk:** root `/` has only ~2.6 GB free, so don't put anything large there. Everything heavy lives on the 500 GB
   ext4 volume `/mnt`: `/mnt/miniforge3`, `/mnt/cache/{pip,conda-pkgs,torch}`, `/mnt/data`, `/mnt/outputs`.
   `data/` and `outputs/` in the repo are symlinks to those.
