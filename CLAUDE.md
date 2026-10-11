@@ -69,7 +69,7 @@ src/
   render_gsplat.py  wrapper around gsplat's rasterizer (Stage 5)
   losses.py         L1, D-SSIM, mask/opacity losses
   densify.py        clone/split/prune, opacity reset, MCMC variant
-  train.py
+  train.py          generic trainer (Blender now, COLMAP later): per-param LRs, resume
   evaluate.py       PSNR / SSIM / LPIPS, render test views
   export.py         .ply in standard 3DGS layout, fly-through video
 tests/

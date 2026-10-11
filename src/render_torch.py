@@ -114,7 +114,8 @@ def project_gaussians(means: Tensor, quats: Tensor, scales: Tensor, viewmat: Ten
 def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colors: Tensor,
            viewmat: Tensor, K: Tensor, W: int, H: int, bg: Tensor | None = None,
            near: float = 0.01, far: float = 1e10, eps2d: float = 0.3, antialiased: bool = False,
-           t_min: float = 1e-4, alpha_min: float = 1 / 255) -> tuple[Tensor, Tensor, dict]:
+           t_min: float = 1e-4, alpha_min: float = 1 / 255,
+           max_pairs: int = 80_000_000) -> tuple[Tensor, Tensor, dict]:
     """Render N activated 3D Gaussians from one camera.
 
     Args:
@@ -140,6 +141,6 @@ def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colo
             radii = torch.where(q_max > 0, radii * torch.sqrt(q_max.clamp(min=0) / 9.0), 0.0)
     img, alpha, info = rasterize(proj["means2d"], proj["conics"], radii, colors, opac, H, W,
                                  depths=proj["depths"], bg=bg, t_min=t_min, alpha_min=alpha_min,
-                                 q_max=q_max)
+                                 q_max=q_max, max_pairs=max_pairs)
     info.update(proj)
     return img, alpha, info

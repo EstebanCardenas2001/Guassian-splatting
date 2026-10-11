@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--downscales", default="4,2,1")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--scale_factors", default="1.0", help="init scale as a multiple of mean spacing")
+    ap.add_argument("--max_pairs", type=int, default=80_000_000)
     ap.add_argument("--out")
     args = ap.parse_args()
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -58,7 +59,8 @@ def main():
                 times = []
                 for i in range(args.iters + 1):
                     torch.cuda.synchronize(); t0 = time.perf_counter()
-                    img, _, info = render(*model.activated(), cam.viewmat, cam.K, cam.width, cam.height, bg=bg)
+                    img, _, info = render(*model.activated(), cam.viewmat, cam.K, cam.width, cam.height, bg=bg,
+                                          max_pairs=args.max_pairs)
                     photometric_loss(img, target).backward()
                     torch.cuda.synchronize()
                     if i > 0:

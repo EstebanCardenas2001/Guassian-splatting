@@ -11,8 +11,8 @@ and explained before the next; this README is updated with the results of every 
 | 1 | 2D Gaussian image fitting | ✅ 38.56 dB @ 20k Gaussians (placeholder image) |
 | 2 | 3D forward model in pure PyTorch | ✅ 15 tests incl. gradcheck, EWA vs Monte Carlo |
 | 3 | Synthetic inverse problem | ✅ exact recovery from GT+noise; 81.5 % from random init, 97.5 % with 2× Gaussians |
-| 4 | Blender lego with my renderer | next |
-| 5 | Tiled CUDA rasterizer (gsplat) | |
+| 4 | Blender lego with my renderer | ✅ 27.88 dB at 400² (no densification); breaks at ~80 M pairs / 10 h per run at 800² |
+| 5 | Tiled CUDA rasterizer (gsplat) | next |
 | 6 | Plant data pipeline | |
 | 7 | Plant training ablations | |
 | 8 | Pushing the T4 to maximum detail | |
@@ -379,6 +379,122 @@ convergence) is an open question carried into Stage 7.
 
 ---
 
+## Stage 4: Blender lego with my renderer
+
+Train the Stage 2 pure-PyTorch renderer on NeRF-Synthetic `lego` (from a Hugging Face
+mirror, `lego` only, 173 MB). Code: [`src/camera.py`](src/camera.py) (`load_blender`),
+[`src/losses.py`](src/losses.py), [`src/train.py`](src/train.py),
+[`configs/stage4_lego_torch.yaml`](configs/stage4_lego_torch.yaml),
+[`scripts/profile_torch_renderer.py`](scripts/profile_torch_renderer.py).
+
+### Data and conventions
+
+`transforms_*.json` stores camera-to-world matrices in Blender/OpenGL axes (x right, y up,
+z backward). Converting to our OpenCV axes means negating the camera's y and z axes:
+$\text{viewmat} = (\text{c2w}_\text{GL}\,\mathrm{diag}(1,-1,-1,1))^{-1}$. Focal length is
+$f = W / (2\tan(\text{fov}_x/2))$. RGBA images are composited onto white at full resolution
+and area-downsampled (both steps are linear, so the order is exact). Tests check that every
+camera is a proper rotation at r ≈ 4.03 aimed at the origin, and that world-up (Blender +z)
+appears as image-up.
+
+### Loss and optimization
+
+$\mathcal{L} = (1-\lambda)\,\lVert I - \hat I\rVert_1 + \lambda\,(1 - \mathrm{SSIM}(I, \hat I))$, with $\lambda = 0.2$
+(the 3DGS form). SSIM uses an 11×11 Gaussian window with σ = 1.5. It matches
+**scikit-image to 10⁻¹⁶**, while torchmetrics differs by about 3·10⁻⁴ at the borders.
+
+Adam with one learning rate per parameter group, as in 3DGS. Position: 6.4·10⁻⁴ ≈ 1.6·10⁻⁴ ×
+scene extent, decayed exponentially to 1/100. Quaternions 10⁻³, log-scales 5·10⁻³,
+opacity logits 0.05, color logits 5·10⁻³. One random view per iteration (each view once per
+epoch), 30k iterations. There is no densification in this stage (that is Stage 7C), so
+following Stage 3 the model starts over-parameterized: **100k Gaussians uniform in
+[−1.3, 1.3]³**, opacity 0.1. Training images stay on the GPU as uint8. Checkpoints are
+written atomically every 1000 iterations, and `--resume` continues an interrupted run.
+
+### Result: 400×400, 30k iterations
+
+| test views | PSNR | SSIM | train time | ms / iter | peak VRAM | Gaussians with o > 1/255 |
+|---|---|---|---|---|---|---|
+| all 200 | **27.88 dB** | **0.933** | 33 min | 65 | 1.68 GB | 39.5k of 100k |
+
+![Lego test renders](docs/figures/stage4_renders.png)
+
+![Lego training](docs/figures/stage4_training.png)
+
+The lego is clearly recognizable. Fine structure (tread links, shading in crevices) is
+softened: with a fixed set of 100k Gaussians and no densification, 60 % of them go
+transparent in empty space and there is no mechanism to add more where detail is missing.
+(For scale: 3DGS with densification reports about 35 dB on lego at 800².)
+
+### Where the pure-PyTorch renderer breaks
+
+The renderer evaluates every (Gaussian, pixel) pair inside each splat's support,
+including pairs behind already opaque surfaces. Early termination zeroes their contribution
+but doesn't skip the work. Cost is therefore set by the number of pairs P, measured over
+44 configurations (random-init and trained states, 200²–800², 10k–3M Gaussians):
+
+$$t \approx 19.9\ \text{ms}\cdot P_{[\mathrm{M}]} + 71\ \text{ms},\qquad
+\text{memory} \approx 177\ \text{B}\cdot P + 0.15\ \text{GB}\ \Rightarrow\ P_\text{max} \approx 81\ \text{M pairs on the T4.}$$
+
+![Cost model](docs/figures/stage4_cost_model.png)
+
+For a given scene, $P \approx \sum_k \text{(footprint area)}_k \propto N\,(s\cdot\text{res})^2$.
+With 3DGS-style initialization (isotropic scale = mean spacing $\propto N^{-1/3}$), that is
+$P \propto N^{1/3}\,\text{res}^2$: halving the initial scale is exactly like halving the resolution.
+
+Trained lego Gaussians, resampled to N (fwd+bwd of one view):
+
+| resolution | 100k | 300k | 1M | 3M |
+|---|---|---|---|---|
+| 200² | 48 ms · 0.1 GB | 79 ms · 0.4 GB | 262 ms · 1.2 GB | 800 ms · 3.5 GB |
+| 400² | 65 ms · 0.3 GB | 137 ms · 0.9 GB | 455 ms · 2.9 GB | 1382 ms · 8.5 GB |
+| 800² | 133 ms · 0.9 GB | 368 ms · 2.8 GB | 1198 ms · 9.3 GB | **OOM** |
+
+**Breaking point.**
+* *Memory:* about 80 M pairs. For trained lego Gaussians that is 800² × ~1.5 M Gaussians.
+  For a 3DGS-style random init (scale = spacing) it already hits at 400² × 100k, and at
+  800² × 10k with half that scale.
+* *Time breaks first in practice:* 800² × 1 M Gaussians is 1.2 s per iteration, i.e.
+  **10 hours for 30k iterations**. Even 800² × 300k (about what 3DGS ends with on lego) is
+  3 hours, before any densification overhead.
+* Full-resolution lego (800²) with a realistic Gaussian count is out of reach in pure
+  PyTorch on a T4. That is the motivation for Stage 5.
+
+<details><summary>Random-init profiles (init scale as a multiple of mean spacing)</summary>
+
+| resolution | N | scale ×1 | scale ×0.5 | scale ×0.25 |
+|---|---|---|---|---|
+| 200² | 10k | 263 ms · 2.5 GB | 82 ms · 0.7 GB | 27 ms · 0.2 GB |
+| 200² | 100k | 602 ms · 5.6 GB | 173 ms · 1.5 GB | 65 ms · 0.5 GB |
+| 200² | 1M | OOM | 633 ms · 4.3 GB | 377 ms · 2.1 GB |
+| 400² | 10k | 1029 ms · 9.8 GB | 278 ms · 2.6 GB | 84 ms · 0.7 GB |
+| 400² | 100k | OOM | 605 ms · 5.6 GB | 175 ms · 1.5 GB |
+| 400² | 1M | OOM | OOM | 626 ms · 4.3 GB |
+| 800² | 10k | OOM | 1067 ms · 10.1 GB | 286 ms · 2.6 GB |
+| 800² | 300k | OOM | OOM | 951 ms · 8.3 GB |
+| 800² | 1M | OOM | OOM | OOM |
+
+Raw data: [`docs/profiles/`](docs/profiles/).
+</details>
+
+### Two exact optimizations found while profiling
+
+Both leave the image bit-identical (the sparse = dense tests still pass) and only avoid
+work:
+
+1. **Opacity-aware support.** A pair contributes only if $o\,e^{-q/2} \ge 1/255$, i.e.
+   $q \le 2\ln(255\,o)$, which is tighter than $q < 9$ whenever $o < 0.35$. That gives 27 % fewer pairs
+   at init (o = 0.1). Fully transparent Gaussians are culled outright, so the 60 % that die
+   in empty space cost nothing.
+2. **Exact ellipse bounding boxes.** Candidates came from a square of half-width
+   $3\sqrt{\lambda_\max}$. Trained splats are thin and tilted, so the square was mostly
+   empty: at 400² × 1 M trained Gaussians there were **81 M candidates for 14 M real pairs**.
+   The ellipse's axis-aligned box has half-widths $\sqrt{q_\max\Sigma'_{xx}}$,
+   $\sqrt{q_\max\Sigma'_{yy}}$, where $\Sigma'_{xx} = C/(AC-B^2)$ comes straight from the conic.
+   That configuration went from over the cap to 455 ms / 2.9 GB.
+
+---
+
 ## Repository layout
 
 ```
@@ -388,8 +504,9 @@ outputs/   -> /mnt/outputs   (runs; not in git)
 docs/figures/                figures embedded in this README
 scripts/      setup_env.sh, check_env.py, gpu_bench.py, gsplat_smoke.py, tensorboard.sh,
               stage1_sweep.sh, plot_stage1.py, stage2_scene.py, stage3_sweep.sh,
-              plot_stage3.py
+              plot_stage3.py, profile_torch_renderer.py, plot_stage4.py
 src/          config.py, run.py, splat2d.py, fit2d.py, rasterize.py, gaussians.py,
-              camera.py, render_torch.py, synthetic.py, fit_synthetic.py, and stubs for later stages
+              camera.py, render_torch.py, synthetic.py, fit_synthetic.py, losses.py, train.py,
+              and stubs for later stages
 tests/        pytest suite
 ```

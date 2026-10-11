@@ -49,21 +49,28 @@ def enumerate_pairs(means2d: Tensor, conics: Tensor, radii: Tensor, H: int, W: i
     """Integer (Gaussian, pixel) pairs with q < q_max (default 9, the 3-sigma ellipse;
     or a per-Gaussian (N,) tensor). Returns (gid, px, py), each (P,) int64.
 
-    The candidate box of Gaussian k is the set of pixels whose *centers* lie within
-    radii[k] of the mean along x and y, clipped to the image:
-        x in [ceil(mx - 0.5 - r), floor(mx - 0.5 + r)] ∩ [0, W-1]   (same for y).
+    The candidate box of Gaussian k is the axis-aligned bounding box of its ellipse
+    q < q_max, i.e. half-widths r_x = sqrt(q_max Sigma_xx), r_y = sqrt(q_max Sigma_yy) with
+    Sigma = conic^{-1}: Sigma_xx = C / (AC - B^2), Sigma_yy = A / (AC - B^2). (For a thin,
+    tilted splat this is far smaller than the square of half-width ``radii``, which is
+    only used as a validity flag and upper bound.) Pixels whose *centers* are in the box:
+        x in [ceil(mx - 0.5 - r_x), floor(mx - 0.5 + r_x)] ∩ [0, W-1]   (same for y).
     With ``sort``, pairs are ordered by (pixel, depth rank): per pixel, front to back.
     """
     N = means2d.shape[0]
     dev = means2d.device
-    m, r = means2d.detach(), radii.detach()
+    m, r, cn = means2d.detach(), radii.detach(), conics.detach()
     valid = (r > 0) & torch.isfinite(m).all(-1)
     r = torch.where(valid, r, 0.0)
     m = torch.where(valid[:, None], m, 0.0)
-    x0 = torch.ceil(m[:, 0] - 0.5 - r).clamp(0, W).long()
-    x1 = torch.floor(m[:, 0] - 0.5 + r).clamp(-1, W - 1).long()
-    y0 = torch.ceil(m[:, 1] - 0.5 - r).clamp(0, H).long()
-    y1 = torch.floor(m[:, 1] - 0.5 + r).clamp(-1, H - 1).long()
+    qm = torch.full_like(r, Q_CUTOFF) if q_max is None else q_max.detach().clamp(min=0)
+    det = (cn[:, 0] * cn[:, 2] - cn[:, 1] ** 2).clamp(min=1e-30)
+    rx = torch.minimum(torch.sqrt(qm * cn[:, 2] / det), r)
+    ry = torch.minimum(torch.sqrt(qm * cn[:, 0] / det), r)
+    x0 = torch.ceil(m[:, 0] - 0.5 - rx).clamp(0, W).long()
+    x1 = torch.floor(m[:, 0] - 0.5 + rx).clamp(-1, W - 1).long()
+    y0 = torch.ceil(m[:, 1] - 0.5 - ry).clamp(0, H).long()
+    y1 = torch.floor(m[:, 1] - 0.5 + ry).clamp(-1, H - 1).long()
     nx = (x1 - x0 + 1).clamp(min=0)
     ny = (y1 - y0 + 1).clamp(min=0)
     counts = torch.where(valid, nx * ny, 0)
@@ -92,7 +99,8 @@ def enumerate_pairs(means2d: Tensor, conics: Tensor, radii: Tensor, H: int, W: i
 def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
               opacities: Tensor, H: int, W: int, depths: Tensor | None = None,
               bg: Tensor | None = None, mode: str = "alpha", t_min: float = 1e-4,
-              alpha_min: float = 0.0, q_max: Tensor | None = None) -> tuple[Tensor, Tensor, dict]:
+              alpha_min: float = 0.0, q_max: Tensor | None = None,
+              max_pairs: int = 80_000_000) -> tuple[Tensor, Tensor, dict]:
     """Render screen-space Gaussians (see module docstring). Differentiable w.r.t.
     means2d, conics, colors, opacities (and bg); radii, depths and q_max only select/sort.
 
@@ -107,7 +115,7 @@ def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
         raise ValueError(f"unknown mode {mode!r}")
     D = colors.shape[-1]
     gid, px, py = enumerate_pairs(means2d, conics, radii, H, W, depths, sort=(mode == "alpha"),
-                                  q_max=q_max)
+                                  q_max=q_max, max_pairs=max_pairs)
     pix = py * W + px
 
     # One packed gather: (P, 2 + 3 + 1 + D) = mean, conic, opacity, color.
