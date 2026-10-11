@@ -17,6 +17,9 @@ and **final quality** (sharp leaf edges, thin stems, terracotta texture, view-de
   `data/` and `outputs/` in the repo are symlinks to those.
 - Conda env `gsplat`: Python 3.12, torch 2.14.1+cu126, nvcc 12.6, gcc 13 (system gcc 15 is too new for nvcc 12.6).
   The activate script sets `TORCH_CUDA_ARCH_LIST=7.5`, `CUDA_HOME`, `CC`/`CXX`.
+- gsplat 1.5.3 is a pure-Python wheel; its CUDA kernels JIT-compile on first use (~2 min, cached in
+  `/mnt/cache/torch_extensions`). Needs the env's `CPATH` (conda-forge CUDA headers live under `targets/`).
+  Smoke test: `python scripts/gsplat_smoke.py`.
 - COLMAP from apt (3.12.6, CPU-only build: use `--SiftExtraction.use_gpu 0 --SiftMatching.use_gpu 0`).
 - Setup: `scripts/setup_env.sh`; sanity check: `python scripts/check_env.py`; TensorBoard: `scripts/tensorboard.sh`.
 - The VM can be interrupted: long jobs run in `tmux` and checkpoint regularly.

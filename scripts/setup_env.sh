@@ -38,6 +38,9 @@ export TORCH_CUDA_ARCH_LIST="7.5"
 export CUDA_HOME=\$CONDA_PREFIX
 export CC=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc
 export CXX=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++
+# conda-forge puts CUDA headers/libs under targets/, not \$CUDA_HOME/include; torch's JIT build needs them.
+export CPATH=\$CONDA_PREFIX/targets/x86_64-linux/include\${CPATH:+:\$CPATH}
+export LIBRARY_PATH=\$CONDA_PREFIX/targets/x86_64-linux/lib\${LIBRARY_PATH:+:\$LIBRARY_PATH}
 export PIP_CACHE_DIR=$BASE/cache/pip
 export TORCH_HOME=$BASE/cache/torch
 export TORCH_EXTENSIONS_DIR=$BASE/cache/torch_extensions
