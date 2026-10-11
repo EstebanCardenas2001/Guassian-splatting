@@ -1,0 +1,12 @@
+_base_: stage4_lego_torch.yaml
+name: stage5_lego_gsplat
+
+data:
+  downscale: 1              # full 800 x 800
+
+model:
+  n: 1000000                # no densification yet (Stage 7): over-parameterize instead (Stage 3)
+  scale_factor: 0.5
+
+render:
+  backend: gsplat

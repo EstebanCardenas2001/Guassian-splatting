@@ -68,12 +68,13 @@ def ewa_covariance_2d(cov3d: Tensor, p_cam: Tensor, viewmat: Tensor, K: Tensor, 
 
 def project_gaussians(means: Tensor, quats: Tensor, scales: Tensor, viewmat: Tensor, K: Tensor,
                       W: int, H: int, near: float = 0.01, far: float = 1e10, eps2d: float = 0.3,
-                      antialiased: bool = False) -> dict[str, Tensor]:
+                      antialiased: bool = False, q_cutoff: float = 9.0) -> dict[str, Tensor]:
     """Project N 3D Gaussians to the image plane.
 
     Returns a dict of per-Gaussian tensors:
         means2d (N, 2) px, cov2d (N, 2, 2), conics (N, 3) = (A, B, C) of cov2d^{-1},
-        depths (N,) camera z, radii (N,) 3-sigma extent in px (0 if culled), valid (N,) bool,
+        depths (N,) camera z, radii (N,) extent sqrt(q_cutoff * lambda_max) in px (3 sigma for
+        the default q_cutoff = 9; 0 if culled), valid (N,) bool,
         opacity_scale (N,): 1, or sqrt(det(cov2d - eps I) / det(cov2d)) in antialiased mode
         (Mip-Splatting's 2D filter: dilation that *conserves* each splat's total energy
         instead of inflating sub-pixel Gaussians).
@@ -96,7 +97,7 @@ def project_gaussians(means: Tensor, quats: Tensor, scales: Tensor, viewmat: Ten
     with torch.no_grad():
         mid = 0.5 * (a + c)
         lam_max = mid + torch.sqrt((mid * mid - det).clamp(min=0.0))
-        radius = 3.0 * torch.sqrt(lam_max.clamp(min=0.0))
+        radius = torch.sqrt(q_cutoff * lam_max.clamp(min=0.0))
         u, v = means2d[:, 0], means2d[:, 1]
         on_screen = (u + radius > 0) & (u - radius < W) & (v + radius > 0) & (v - radius < H)
         valid = ok & on_screen & torch.isfinite(means2d).all(-1)
@@ -115,7 +116,8 @@ def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colo
            viewmat: Tensor, K: Tensor, W: int, H: int, bg: Tensor | None = None,
            near: float = 0.01, far: float = 1e10, eps2d: float = 0.3, antialiased: bool = False,
            t_min: float = 1e-4, alpha_min: float = 1 / 255,
-           max_pairs: int = 80_000_000) -> tuple[Tensor, Tensor, dict]:
+           max_pairs: int = 80_000_000, alpha_max: float = 0.99,
+           q_cutoff: float = 9.0) -> tuple[Tensor, Tensor, dict]:
     """Render N activated 3D Gaussians from one camera.
 
     Args:
@@ -124,12 +126,15 @@ def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colo
         bg: (D,) background color (None = black).
         t_min: early-termination transmittance; alpha_min: skip splats with alpha below it
             (3DGS uses 1/255).
+        alpha_max, q_cutoff: alpha clamp and support q < q_cutoff. Defaults follow the 3DGS
+            paper (0.99, 3 sigma); gsplat 1.5 uses 0.999 and 3.33 sigma (q < 11.09).
     Returns:
         image (H, W, D), alpha (H, W) = accumulated opacity, info dict with the projection
         outputs (``means2d`` is the tensor whose gradient drives densification in Stage 7)
         and ``pairs``.
     """
-    proj = project_gaussians(means, quats, scales, viewmat, K, W, H, near, far, eps2d, antialiased)
+    proj = project_gaussians(means, quats, scales, viewmat, K, W, H, near, far, eps2d, antialiased,
+                             q_cutoff)
     opac = opacities * proj["opacity_scale"]
     radii, q_max = proj["radii"], None
     if alpha_min > 0:
@@ -137,10 +142,11 @@ def render(means: Tensor, quats: Tensor, scales: Tensor, opacities: Tensor, colo
         # q <= 2 ln(o / alpha_min). Pairs beyond it would be skipped anyway, so the image is
         # unchanged; it only avoids enumerating them. Shrinks the pixel box accordingly.
         with torch.no_grad():
-            q_max = (2 * torch.log(opac.detach() / alpha_min)).clamp(max=9.0)
-            radii = torch.where(q_max > 0, radii * torch.sqrt(q_max.clamp(min=0) / 9.0), 0.0)
+            q_max = (2 * torch.log(opac.detach() / alpha_min)).clamp(max=q_cutoff)
+            radii = torch.where(q_max > 0, radii * torch.sqrt(q_max.clamp(min=0) / q_cutoff), 0.0)
     img, alpha, info = rasterize(proj["means2d"], proj["conics"], radii, colors, opac, H, W,
                                  depths=proj["depths"], bg=bg, t_min=t_min, alpha_min=alpha_min,
-                                 q_max=q_max, max_pairs=max_pairs)
+                                 q_max=q_max if q_max is not None else torch.full_like(opac, q_cutoff),
+                                 max_pairs=max_pairs, alpha_max=alpha_max)
     info.update(proj)
     return img, alpha, info

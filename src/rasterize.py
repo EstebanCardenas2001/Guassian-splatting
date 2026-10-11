@@ -100,7 +100,7 @@ def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
               opacities: Tensor, H: int, W: int, depths: Tensor | None = None,
               bg: Tensor | None = None, mode: str = "alpha", t_min: float = 1e-4,
               alpha_min: float = 0.0, q_max: Tensor | None = None,
-              max_pairs: int = 80_000_000) -> tuple[Tensor, Tensor, dict]:
+              max_pairs: int = 80_000_000, alpha_max: float = ALPHA_MAX) -> tuple[Tensor, Tensor, dict]:
     """Render screen-space Gaussians (see module docstring). Differentiable w.r.t.
     means2d, conics, colors, opacities (and bg); radii, depths and q_max only select/sort.
 
@@ -134,7 +134,7 @@ def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
         acc = means2d.new_zeros(H * W).index_add(0, pix, w)
         return out.view(H, W, D), acc.view(H, W), info
 
-    alpha = w.clamp(max=ALPHA_MAX)
+    alpha = w.clamp(max=alpha_max)
     used = (alpha.detach() >= alpha_min) if alpha_min > 0 else torch.ones_like(alpha, dtype=torch.bool)
 
     # Segmented exclusive cumsum of log(1 - alpha) per pixel, in float64.
@@ -165,7 +165,8 @@ def rasterize(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
 def rasterize_dense(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tensor,
                     opacities: Tensor, H: int, W: int, depths: Tensor | None = None,
                     bg: Tensor | None = None, t_min: float = 1e-4,
-                    alpha_min: float = 0.0) -> tuple[Tensor, Tensor]:
+                    alpha_min: float = 0.0, alpha_max: float = ALPHA_MAX,
+                    q_cutoff: float = Q_CUTOFF) -> tuple[Tensor, Tensor]:
     """O(N * H * W) reference for :func:`rasterize` (alpha mode). Tiny scenes / tests only.
 
     Sorts Gaussians globally by depth and composites every Gaussian at every pixel with an
@@ -180,7 +181,7 @@ def rasterize_dense(means2d: Tensor, conics: Tensor, radii: Tensor, colors: Tens
     dx = xs.reshape(1, -1).to(m.dtype) + 0.5 - m[:, :1]                  # (N, HW)
     dy = ys.reshape(1, -1).to(m.dtype) + 0.5 - m[:, 1:]
     q = conic_quadratic(dx, dy, cn[:, None, :])
-    alpha = torch.where(q < Q_CUTOFF, o[:, None] * torch.exp(-0.5 * q), 0.0).clamp(max=ALPHA_MAX)
+    alpha = torch.where(q < q_cutoff, o[:, None] * torch.exp(-0.5 * q), 0.0).clamp(max=alpha_max)
     if alpha_min > 0:
         alpha = torch.where(alpha >= alpha_min, alpha, 0.0)
     one_minus = 1.0 - alpha

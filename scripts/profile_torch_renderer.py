@@ -16,7 +16,7 @@ import torch
 from src.camera import load_blender
 from src.gaussians import Gaussians
 from src.losses import photometric_loss
-from src.render_torch import render
+from src.render_torch import render as render_torch
 from src.run import REPO_ROOT
 
 
@@ -39,9 +39,15 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--scale_factors", default="1.0", help="init scale as a multiple of mean spacing")
     ap.add_argument("--max_pairs", type=int, default=80_000_000)
+    ap.add_argument("--backend", default="torch", choices=["torch", "gsplat"])
     ap.add_argument("--out")
     args = ap.parse_args()
     gen = torch.Generator(device="cuda").manual_seed(0)
+    if args.backend == "gsplat":
+        from src.render_gsplat import render as render_gs
+        render = lambda *a, max_pairs=None, **k: render_gs(*a, **k)
+    else:
+        render = render_torch
     rows = []
     for ds in map(int, args.downscales.split(",")):
         cams, imgs = load_blender(REPO_ROOT / "data/nerf_synthetic/lego", "train", downscale=ds)
@@ -50,7 +56,7 @@ def main():
         bg = torch.ones(3, device="cuda")
         for n, sf in [(n, sf) for sf in map(float, args.scale_factors.split(","))
                       for n in map(int, args.ns.split(","))]:
-            row = {"res": cam.width, "n": n, "scale_factor": sf}
+            row = {"res": cam.width, "n": n, "scale_factor": sf, "backend": args.backend}
             model = None
             try:
                 model = make_gaussians(n, args.ckpt, gen, sf)
