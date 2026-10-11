@@ -74,12 +74,38 @@ def main():
         print(f"| {mode} | {n} | {m['psnr']:.2f} | {m['ms_per_iter']:.1f} | "
               f"{m['pairs_final'] / 1e6:.2f} | {m['peak_mem_GB']:.2f} | {d.name} |")
 
-    # Render panel: target + each N for alpha compositing, plus a zoomed crop row.
-    alpha_runs = sorted((n, d) for (md, n), (_, d) in runs.items() if md == "alpha")
-    if alpha_runs:
-        tgt = iio.imread(alpha_runs[0][1] / "renders" / "target.png")
+    # Training curves from the TensorBoard logs: PSNR vs iteration, one panel per blending.
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    shades = {1000: 0.35, 5000: 0.65, 20000: 1.0}            # lighter = fewer Gaussians
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), dpi=150, sharey=True)
+    for ax, mode in zip(axes, ("additive", "alpha")):
+        for (md, n), (_, d) in sorted(runs.items()):
+            if md != mode:
+                continue
+            ea = EventAccumulator(str(d / "tb")); ea.Reload()
+            ev = ea.Scalars("train/psnr")
+            ax.plot([e.step for e in ev], [e.value for e in ev], lw=2, color=COLORS[mode],
+                    alpha=shades.get(n, 1.0), label=f"N = {n // 1000}k")
+        ax.axhline(30, color=MUTED, lw=1, ls="--")
+        ax.set_title(LABELS[mode], loc="left", fontsize=10, color=INK)
+        ax.set_xlabel("iteration", color=MUTED)
+        ax.grid(axis="y", color=GRID, lw=0.8)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.tick_params(colors=MUTED, labelsize=8)
+        ax.legend(frameon=False, fontsize=8, loc="lower right")
+    axes[0].set_ylabel("train PSNR (dB)", color=MUTED)
+    fig.tight_layout()
+    fig.savefig(out / "stage1_training_curves.png")
+
+    # Render panels: target + each N, plus a zoomed crop row, one figure per blending.
+    for mode in ("additive", "alpha"):
+        mode_runs = sorted((n, d) for (md, n), (_, d) in runs.items() if md == mode)
+        if not mode_runs:
+            continue
+        tgt = iio.imread(mode_runs[0][1] / "renders" / "target.png")
         imgs = [("target", tgt)] + [(f"N = {n // 1000}k", iio.imread(d / "renders" / "final.png"))
-                                     for n, d in alpha_runs]
+                                     for n, d in mode_runs]
         H = tgt.shape[0]
         y0, x0, s = H // 8, H // 3, H // 4            # zoom window
         fig, axes = plt.subplots(2, len(imgs), figsize=(3 * len(imgs), 6), dpi=150)
@@ -90,8 +116,9 @@ def main():
             for a in axes[:, j]:
                 a.set_xticks([]); a.set_yticks([])
         axes[1, 0].set_ylabel(f"zoom {s}×{s} px", fontsize=9, color=MUTED)
+        fig.suptitle(LABELS[mode], fontsize=11, color=INK, x=0.01, ha="left")
         fig.tight_layout()
-        fig.savefig(out / "stage1_renders_alpha.png")
+        fig.savefig(out / f"stage1_renders_{mode}.png")
     print(f"figures -> {out}")
 
 

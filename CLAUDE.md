@@ -56,8 +56,9 @@ and **final quality** (sharp leaf edges, thin stems, terracotta texture, view-de
 configs/            one YAML per experiment
 data/ -> /mnt/data  raw photos, downscaled images, masks, COLMAP sparse/, nerf_synthetic/
 outputs/ -> /mnt/outputs
-scripts/            setup_env.sh, check_env.py, tensorboard.sh
+scripts/            setup_env.sh, check_env.py, gpu_bench.py, tensorboard.sh, stage1_*
 src/
+  splat2d.py, fit2d.py  Stage 1 2D renderer + fitting
   config.py         YAML loading (+ _base_ inheritance, dotlist overrides)
   run.py            seeding, git provenance, run directories, metrics.json
   camera.py         intrinsics/extrinsics, COLMAP + Blender loaders
