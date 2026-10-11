@@ -1,0 +1,31 @@
+_base_: base.yaml
+name: stage1_fit2d
+
+image:
+  path: data/test_images/astronaut.png   # swap for a plant photo when available
+  crop: 512                              # center crop, pixels (square)
+
+model:
+  n: 20000
+  mode: alpha            # additive | alpha
+  init: uniform          # uniform | gradient (sample means ∝ local image gradient magnitude)
+  scale_init: 0.5        # sigma0 = scale_init * sqrt(H*W / n)
+  opacity_init: 0.5
+  bg: [0.0, 0.0, 0.0]
+  t_min: 1.0e-4
+  max_radius: 64
+
+train:
+  iterations: 4000
+  loss: l2                 # l2 | l1
+  # Adam learning rates (in the units of the raw parameters), decayed exponentially
+  # to lr * lr_final_factor over the run.
+  lr:
+    means: 0.1             # pixels
+    theta: 0.02            # radians
+    log_scales: 0.02
+    color_logits: 0.02
+    opacity_logits: 0.05
+  lr_final_factor: 0.01
+  log_every: 50
+  render_every: 1000
