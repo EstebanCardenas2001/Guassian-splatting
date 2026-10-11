@@ -25,10 +25,9 @@ def make_gaussians(n, ckpt, gen, scale_factor=1.0):
         lo, hi = torch.full((3,), -1.3, device="cuda"), torch.full((3,), 1.3, device="cuda")
         return Gaussians.random_box(n, lo, hi, scale=scale_factor * 2.6 / n ** (1 / 3),
                                     opacity=0.1, generator=gen)
-    sd = torch.load(ckpt, map_location="cuda")["model"]
-    idx = torch.randint(0, sd["means"].shape[0], (n,), device="cuda", generator=gen)
-    return Gaussians(*(sd[k][idx].clone() for k in
-                       ("means", "quats", "log_scales", "opacity_logits", "color_logits")))
+    full = Gaussians.from_state_dict(torch.load(ckpt, map_location="cuda", weights_only=False)["model"])
+    idx = torch.randint(0, len(full), (n,), device="cuda", generator=gen)
+    return Gaussians(*(full.params[k][idx].clone() for k in Gaussians.KEYS))
 
 
 def main():

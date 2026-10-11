@@ -45,24 +45,53 @@ def logit(p: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 class Gaussians(nn.Module):
-    """Raw (unconstrained) parameters of N 3D Gaussians; call :meth:`activated` to render."""
+    """Raw (unconstrained) parameters of N 3D Gaussians; call :meth:`activated` to render.
+
+    Stored in ``self.params``, an ``nn.ParameterDict`` keyed with gsplat's names so that
+    gsplat's densification strategies can grow/prune it in place:
+        means (N, 3) | quats (N, 4) | scales (N, 3) = log-scales |
+        opacities (N,) = opacity logits | colors (N, 3) = color logits
+    The descriptive names used in Stages 3-4 (``log_scales``, ``opacity_logits``,
+    ``color_logits``) remain available as attribute aliases.
+    """
+
+    KEYS = ("means", "quats", "scales", "opacities", "colors")
+    ALIASES = {"log_scales": "scales", "opacity_logits": "opacities", "color_logits": "colors"}
 
     def __init__(self, means: Tensor, quats: Tensor, log_scales: Tensor,
                  opacity_logits: Tensor, color_logits: Tensor):
         super().__init__()
-        self.means = nn.Parameter(means)
-        self.quats = nn.Parameter(quats)
-        self.log_scales = nn.Parameter(log_scales)
-        self.opacity_logits = nn.Parameter(opacity_logits)
-        self.color_logits = nn.Parameter(color_logits)
+        self.params = nn.ParameterDict({
+            "means": nn.Parameter(means), "quats": nn.Parameter(quats),
+            "scales": nn.Parameter(log_scales), "opacities": nn.Parameter(opacity_logits),
+            "colors": nn.Parameter(color_logits)})
+
+    def __getattr__(self, name):
+        if name in Gaussians.KEYS:
+            return self._modules["params"][name]
+        if name in Gaussians.ALIASES:
+            return self._modules["params"][Gaussians.ALIASES[name]]
+        return super().__getattr__(name)
 
     def __len__(self) -> int:
-        return self.means.shape[0]
+        return self.params["means"].shape[0]
 
     def activated(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """(means, quats, scales, opacities, colors) in the order ``render`` expects."""
-        return (self.means, self.quats, torch.exp(self.log_scales),
-                torch.sigmoid(self.opacity_logits), torch.sigmoid(self.color_logits))
+        p = self.params
+        return (p["means"], p["quats"], torch.exp(p["scales"]),
+                torch.sigmoid(p["opacities"]), torch.sigmoid(p["colors"]))
+
+    @classmethod
+    def from_state_dict(cls, sd: dict) -> "Gaussians":
+        """Rebuild from a state dict of any size (densification changes N), in either the
+        current layout (``params.<key>``) or the Stage 3-4 layout (``means``, ``log_scales``...)."""
+        def get(key):
+            for k in (f"params.{key}", key, *[a for a, v in cls.ALIASES.items() if v == key]):
+                if k in sd:
+                    return sd[k].clone()
+            raise KeyError(key)
+        return cls(*(get(k) for k in cls.KEYS))
 
     @classmethod
     def from_activated(cls, means, quats, scales, opacities, colors) -> "Gaussians":

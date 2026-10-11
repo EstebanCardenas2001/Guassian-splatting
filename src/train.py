@@ -29,7 +29,28 @@ from src.gaussians import Gaussians
 from src.losses import photometric_loss, psnr, ssim
 from src.run import REPO_ROOT, make_run_dir, seed_everything, write_metrics
 
-PARAMS = ("means", "quats", "log_scales", "opacity_logits", "color_logits")
+# config learning-rate names (descriptive) -> parameter keys (gsplat's names)
+LR_KEYS = {"means": "means", "quats": "quats", "log_scales": "scales",
+           "opacity_logits": "opacities", "color_logits": "colors"}
+
+
+def make_strategy(cfg, train_cams):
+    """Densification strategy (None, or gsplat's DefaultStrategy = 3DGS adaptive density
+    control) and its state. ``scene_scale`` follows 3DGS: 1.1 x the largest distance from
+    the cameras' centroid to a camera."""
+    d = cfg.get("densify", {"strategy": "none"})
+    if d["strategy"] == "none":
+        return None, None
+    if d["strategy"] != "gsplat_default":
+        raise ValueError(d["strategy"])
+    if cfg.render.backend != "gsplat":
+        raise ValueError("gsplat strategies need the gsplat backend's meta")
+    from gsplat.strategy import DefaultStrategy
+    kw = {k: v for k, v in d.items() if k not in ("strategy", "scene_scale")}
+    strategy = DefaultStrategy(**kw)
+    centers = torch.stack([c.center for c in train_cams])
+    scene_scale = d.get("scene_scale") or float(1.1 * (centers - centers.mean(0)).norm(dim=-1).max())
+    return strategy, strategy.initialize_state(scene_scale=scene_scale)
 
 
 def get_renderer(cfg):
@@ -106,27 +127,38 @@ def main(argv=None):
     render_fn = get_renderer(cfg)
     gen = torch.Generator(device=dev).manual_seed(cfg.seed)
     model = init_model(cfg, dev, gen)
-    opt = torch.optim.Adam([{"params": [getattr(model, k)], "lr": tc.lr[k], "name": k} for k in PARAMS],
-                           eps=1e-15)
-    means_group = next(g for g in opt.param_groups if g["name"] == "means")
+    ckpt_path = run_dir / "ckpt.pt"
+    ck = torch.load(ckpt_path, map_location=dev, weights_only=False) \
+        if args.resume and ckpt_path.exists() else None
+    if ck is not None:
+        model = Gaussians.from_state_dict(ck["model"]).to(dev)    # N may have changed
+
+    # One Adam per parameter tensor (what gsplat's strategies expect: they replace a tensor
+    # when Gaussians are added/removed and rewrite that optimizer's state accordingly).
+    opts = {key: torch.optim.Adam([{"params": [model.params[key]], "lr": tc.lr[name], "name": key}],
+                                  eps=1e-15) for name, key in LR_KEYS.items()}
     gamma = (tc.means_lr_final / tc.lr.means) ** (1.0 / tc.iterations)
+    strategy, strategy_state = make_strategy(cfg, train_cams)
+    if strategy is not None:
+        strategy.check_sanity(model.params, opts)
     eval_idx = np.linspace(0, len(test_cams) - 1, cfg.data.eval_subset).round().astype(int).tolist()
     view_gen = torch.Generator().manual_seed(cfg.seed)
     start, order, elapsed = 0, [], 0.0
 
-    ckpt_path = run_dir / "ckpt.pt"
-    if args.resume and ckpt_path.exists():
-        ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["optim"])
+    if ck is not None:
+        for key, o in opts.items():
+            o.load_state_dict(ck["optim"][key])
+        if strategy is not None:
+            strategy_state = ck["strategy_state"]
         start, order, elapsed = ck["iteration"], ck["order"], ck["elapsed"]
         view_gen.set_state(ck["view_gen"].cpu())       # CPU generator; map_location moved it
         print(f"resumed at iteration {start}")
 
     def save_ckpt(it):
         tmp = run_dir / "ckpt.pt.tmp"
-        torch.save({"model": model.state_dict(), "optim": opt.state_dict(), "iteration": it,
-                    "order": order, "elapsed": elapsed, "view_gen": view_gen.get_state()}, tmp)
+        torch.save({"model": model.state_dict(), "optim": {k: o.state_dict() for k, o in opts.items()},
+                    "strategy_state": strategy_state, "iteration": it, "order": order,
+                    "elapsed": elapsed, "view_gen": view_gen.get_state()}, tmp)
         tmp.replace(ckpt_path)          # atomic: an interruption never leaves a torn checkpoint
 
     print(f"{len(model)} Gaussians, {len(train_cams)} train / {len(test_cams)} test views at "
@@ -140,10 +172,19 @@ def main(argv=None):
         img, alpha, info = render_fn(model, train_cams[i], bg)
         ref = train_imgs[i].float() / 255
         loss = photometric_loss(img, ref, tc.lambda_dssim)
-        opt.zero_grad(set_to_none=True)
+        if strategy is not None:
+            strategy.step_pre_backward(model.params, opts, strategy_state, it, info["meta"])
         loss.backward()
-        opt.step()
-        means_group["lr"] = tc.lr.means * gamma ** it
+        for o in opts.values():
+            o.step()
+            o.zero_grad(set_to_none=True)
+        opts["means"].param_groups[0]["lr"] = tc.lr.means * gamma ** it
+        if strategy is not None:
+            # After the optimizer step, as in gsplat's reference trainer: accumulate the
+            # screen-space gradient of means2d (kept on the non-leaf tensor), then every
+            # refine_every steps clone/split/prune and periodically reset opacities.
+            strategy.step_post_backward(model.params, opts, strategy_state, it, info["meta"],
+                                        packed=True)
 
         if it % tc.log_every == 0:
             torch.cuda.synchronize()
@@ -158,10 +199,11 @@ def main(argv=None):
             tb.add_scalar("perf/pairs_M", info["pairs"] / 1e6, it)
             tb.add_scalar("perf/peak_mem_GB", torch.cuda.max_memory_allocated() / 2**30, it)
             tb.add_scalar("model/visible_gaussians", n_vis, it)
+            tb.add_scalar("model/n_gaussians", len(model), it)
             tb.add_scalar("model/opacity_gt_1_255",
                           int((torch.sigmoid(model.opacity_logits) > 1 / 255).sum()), it)
             print(f"[{it:6d}] loss {loss.item():.4f}  {1e3 * dt:6.0f} ms/it  pairs {info['pairs'] / 1e6:5.1f}M  "
-                  f"visible {n_vis:7d}  peak {torch.cuda.max_memory_allocated() / 2**30:5.2f} GB", flush=True)
+                  f"visible {n_vis:7d}  N {len(model):8d}  peak {torch.cuda.max_memory_allocated() / 2**30:5.2f} GB", flush=True)
         if it % tc.eval_every == 0 or it == tc.iterations:
             p, s = evaluate(render_fn, model, test_cams, test_imgs, bg, eval_idx)
             tb.add_scalar("test/psnr", p, it)
@@ -181,7 +223,8 @@ def main(argv=None):
                "ms_per_iter_mean": 1e3 * elapsed / max(tc.iterations - start, 1) if start == 0 else None,
                "peak_mem_GB": torch.cuda.max_memory_allocated() / 2**30,
                "n_gaussians": len(model), "n_opacity_gt_1_255": int((o > 1 / 255).sum()),
-               "backend": cfg.render.backend}
+               "backend": cfg.render.backend,
+               "densify": cfg.get("densify", {}).get("strategy", "none")}
     write_metrics(run_dir, metrics)
     tb.close()
     print(json.dumps(metrics, indent=1))
