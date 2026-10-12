@@ -15,5 +15,6 @@ pycolmap
 viser
 jupyterlab
 rembg[gpu]
+onnxruntime-gpu==1.26.0   # newest CUDA-12 build (1.27+ need CUDA 13); reuses torch cu126 libs
 huggingface_hub
 scikit-image

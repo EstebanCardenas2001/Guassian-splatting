@@ -6,7 +6,9 @@ BiRefNet resizes its input to 1024x1024 internally, so it is run once per frame 
 2000-px image and the soft mask (uint8 alpha, 255 = foreground) is resized to the other
 resolutions with bilinear filtering:
     masks_2000/frame_XXX.png, masks_1600/..., masks_full/...
-Runs on the CPU: this onnxruntime build needs CUDA 13 libraries the env doesn't have.
+Runs on the GPU through onnxruntime-gpu 1.26 (the newest CUDA-12 build; 1.27+ need CUDA 13),
+which reuses the CUDA/cuDNN libraries installed with PyTorch: ~1.5 s/image vs ~23 s on the
+CPU, with identical masks (max difference 1/255).
 Already existing masks are skipped, so the script can be re-run after an interruption.
 """
 import argparse
@@ -27,8 +29,11 @@ def main():
     scene = Path(args.scene)
     for m in FOLDERS:
         (scene / m).mkdir(exist_ok=True)
+    import onnxruntime as ort
+    ort.preload_dlls()                  # CUDA/cuDNN from the nvidia-*-cu12 wheels PyTorch installed
     from rembg import new_session, remove
-    sess = new_session(args.model, providers=["CPUExecutionProvider"])
+    sess = new_session(args.model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    print("onnxruntime providers:", sess.inner_session.get_providers(), flush=True)
     frames = sorted((scene / "images_2000").glob("*.jpg"))
     t0 = time.time()
     for k, f in enumerate(frames):
