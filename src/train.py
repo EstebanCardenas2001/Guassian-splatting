@@ -59,13 +59,13 @@ def make_strategy(cfg, train_cams):
         kw = {k: v for k, v in kw.items() if k in fields}
     if d["strategy"] == "gsplat_default":
         from gsplat.strategy import DefaultStrategy
-        strategy = DefaultStrategy(**accepted(DefaultStrategy))
+        strategy = DefaultStrategy(**kw)
     elif d["strategy"] == "adc":                    # my 3DGS ADC (absgrad=true: AbsGS)
         from src.densify import ADC
-        strategy = ADC(**accepted(ADC))
+        strategy = ADC(**kw)
     elif d["strategy"] == "mcmc":                   # my 3DGS-MCMC, hard cap on N
         from src.densify import MCMC
-        strategy = MCMC(**accepted(MCMC))
+        strategy = MCMC(**kw)
     else:
         raise ValueError(d["strategy"])
     centers = torch.stack([c.center for c in train_cams])
