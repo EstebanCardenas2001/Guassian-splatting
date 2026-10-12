@@ -227,6 +227,7 @@ Two findings worth keeping:
 ## 5. Next
 
 * **Stage 6:** plant photos → COLMAP camera poses → foreground masks → data loader.
+  How to take the photos: [`docs/CAPTURE_GUIDE.md`](docs/CAPTURE_GUIDE.md).
 * **Stage 7:** plant training, one feature at a time (mask loss, densification, spherical
   harmonics for view-dependent leaf sheen, SfM vs random initialization).
 * **Stage 8:** push resolution and Gaussian count to the T4's limits (AbsGS, 3DGS-MCMC,
