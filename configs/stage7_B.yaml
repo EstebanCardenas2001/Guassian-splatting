@@ -1,0 +1,4 @@
+_base_: stage7_A.yaml
+name: stage7_B_mask           # + mask loss |alpha - m|
+train:
+  lambda_mask: 0.1

@@ -1,0 +1,8 @@
+_base_: stage7_D.yaml
+name: stage7_E_randinit       # D with a random-box init instead of SfM points
+model:
+  init: random_box
+  n: 100000
+  box: null                   # bounding box of the foreground SfM points + 10 % margin
+  box_margin: 0.1
+  scale_factor: 0.7

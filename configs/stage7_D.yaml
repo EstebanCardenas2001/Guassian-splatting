@@ -1,0 +1,4 @@
+_base_: stage7_C.yaml
+name: stage7_D_sh             # + spherical harmonics, degree 0 -> 3 (one step per 1000 it.)
+model:
+  sh_degree: 3

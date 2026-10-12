@@ -1,0 +1,47 @@
+_base_: base.yaml
+name: stage7_base
+
+data:
+  type: colmap
+  path: data/plant
+  model: colmap_incremental/sparse/1
+  res: 1600                  # undistorted 1200 x 1600
+  test_every: 8              # 189 train / 27 test
+  use_masks: true            # target = photo composited onto bg with the BiRefNet mask
+  bg: [1.0, 1.0, 1.0]
+  eval_subset: 9
+
+model:
+  init: sfm                  # foreground SfM points (filtered with the masks)
+  opacity: 0.1
+  sh_degree: null            # null = view-independent RGB
+
+render:
+  backend: gsplat
+  eps2d: 0.3
+  antialiased: false
+
+densify:
+  strategy: none
+
+train:
+  iterations: 30000
+  lambda_dssim: 0.2
+  lambda_mask: 0.0
+  sh_every: 1000             # raise the active SH degree every 1000 steps (3DGS)
+  # scene normalized to camera radius 4 (like the lego), so the Stage 4-5 rates transfer
+  lr:
+    means: 6.4e-4
+    quats: 1.0e-3
+    log_scales: 5.0e-3
+    opacity_logits: 5.0e-2
+    color_logits: 5.0e-3
+    sh0: 2.5e-3              # 3DGS: features_dc
+    shN: 1.25e-4             # 3DGS: features_rest = dc / 20
+  means_lr_final: 6.4e-6
+  log_every: 100
+  eval_every: 1000
+  ckpt_every: 1000
+
+eval:
+  lpips: true

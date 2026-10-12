@@ -1,19 +1,23 @@
-"""Train 3D Gaussians on a posed image set.
+"""Train 3D Gaussians on a posed image set (NeRF-synthetic or a COLMAP capture).
 
-    python -m src.train --config configs/stage4_lego_torch.yaml [key=value ...]
+    python -m src.train --config configs/stage7_A.yaml [key=value ...]
     python -m src.train --resume outputs/<run_dir>          # continue an interrupted run
 
 One random training view per iteration (each epoch visits every view once, in random
-order), loss (1 - lambda) L1 + lambda (1 - SSIM), per-parameter Adam learning rates with
-exponential decay on the position LR. Training images live on the GPU as uint8.
-A checkpoint (model, optimizer, iteration, RNG state) is written every ``ckpt_every``
-iterations so the VM can be interrupted.
+order). Loss:
+    L = (1 - lambda) L1(I, I*) + lambda (1 - SSIM(I, I*)) + lambda_mask |alpha - m|_1
+where, for masked captures, the target I* = m * photo + (1 - m) * bg is the photo
+composited onto the fixed background with the foreground mask m in [0, 1], and the render
+uses the same background. The mask term (Stage 7B) asks the rendered opacity to be 1 on
+the object and 0 elsewhere; without it, Gaussians the color of the background are free.
+Per-parameter Adam learning rates, exponential decay on the position LR, optional
+densification (src/densify.py) and progressive spherical harmonics (src/sh.py).
+Images and masks live on the GPU as uint8; checkpoints are atomic and resumable.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from pathlib import Path
 
@@ -23,31 +27,31 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from src.camera import load_blender
+from src.camera import load_blender, load_colmap
 from src.config import load_config
 from src.gaussians import Gaussians
 from src.losses import photometric_loss, psnr, ssim
 from src.run import REPO_ROOT, make_run_dir, seed_everything, write_metrics
 
-# config learning-rate names (descriptive) -> parameter keys (gsplat's names)
+# config learning-rate names -> parameter keys (gsplat's names)
 LR_KEYS = {"means": "means", "quats": "quats", "log_scales": "scales",
-           "opacity_logits": "opacities", "color_logits": "colors"}
+           "opacity_logits": "opacities", "color_logits": "colors", "sh0": "sh0", "shN": "shN"}
 
 
+# ----------------------------------------------------------------------------- setup
 def make_strategy(cfg, train_cams):
-    """Densification strategy (None, or gsplat's DefaultStrategy = 3DGS adaptive density
-    control) and its state. ``scene_scale`` follows 3DGS: 1.1 x the largest distance from
-    the cameras' centroid to a camera."""
+    """Densification strategy (None, gsplat's DefaultStrategy, or my ADC) and its state.
+    ``scene_scale`` follows 3DGS: 1.1 x the largest camera distance from their centroid."""
     d = cfg.get("densify", {"strategy": "none"})
     if d["strategy"] == "none":
         return None, None
     if cfg.render.backend != "gsplat":
         raise ValueError("densification needs the gsplat backend's meta (screen-space means)")
     kw = {k: v for k, v in d.items() if k not in ("strategy", "scene_scale")}
-    if d["strategy"] == "gsplat_default":           # reference implementation
+    if d["strategy"] == "gsplat_default":
         from gsplat.strategy import DefaultStrategy
         strategy = DefaultStrategy(**kw)
-    elif d["strategy"] == "adc":                    # my implementation (src/densify.py)
+    elif d["strategy"] == "adc":
         from src.densify import ADC
         strategy = ADC(**kw)
     else:
@@ -65,46 +69,130 @@ def get_renderer(cfg):
     else:
         raise ValueError(cfg.render.backend)
     eps2d, aa = cfg.render.eps2d, cfg.render.antialiased
-    return lambda model, cam, bg: render(*model.activated(), cam.viewmat, cam.K, cam.width,
-                                         cam.height, bg=bg, eps2d=eps2d, antialiased=aa)
+
+    def render_fn(model, cam, bg, sh_degree=None):
+        colors = model.colors_for(cam.viewmat, sh_degree)
+        return render(*model.geometry(), colors, cam.viewmat, cam.K, cam.width, cam.height,
+                      bg=bg, eps2d=eps2d, antialiased=aa)
+    return render_fn
 
 
-def load_data(cfg, device):
+def load_data(cfg, device) -> dict:
+    """Uniform dict: {train,test}_{cams,imgs,masks} (masks None without masks), points, colors."""
     d = cfg.data
-    if d.type != "blender":
+    if d.type == "blender":
+        path = REPO_ROOT / d.path
+        trc, tri = load_blender(path, "train", d.downscale, tuple(d.bg))
+        tec, tei = load_blender(path, "test", d.downscale, tuple(d.bg))
+        out = {"train_cams": trc, "train_imgs": tri, "train_masks": None,
+               "test_cams": tec, "test_imgs": tei, "test_masks": None, "points": None, "colors": None}
+    elif d.type == "colmap":
+        c = load_colmap(REPO_ROOT / d.path, res=str(d.res), model=d.model, test_every=d.test_every)
+        out = {"train_cams": c["train_cams"], "train_imgs": c["train_images"],
+               "test_cams": c["test_cams"], "test_imgs": c["test_images"],
+               "train_masks": c["train_masks"] if d.use_masks else None,
+               "test_masks": c["test_masks"] if d.use_masks else None,
+               "points": torch.as_tensor(c["points"]), "colors": torch.as_tensor(c["point_colors"])}
+    else:
         raise ValueError(d.type)
-    path = REPO_ROOT / d.path
-    train_cams, train_imgs = load_blender(path, "train", d.downscale, tuple(d.bg))
-    test_cams, test_imgs = load_blender(path, "test", d.downscale, tuple(d.bg))
-    return ([c.to(device) for c in train_cams], train_imgs.to(device),
-            [c.to(device) for c in test_cams], test_imgs.to(device))
+    for k in ("train_cams", "test_cams"):
+        out[k] = [cam.to(device) for cam in out[k]]
+    for k in ("train_imgs", "test_imgs", "train_masks", "test_masks"):
+        if out[k] is not None:
+            out[k] = out[k].to(device)
+    return out
 
 
-def init_model(cfg, device, gen) -> Gaussians:
-    m = cfg.model
-    if m.init != "random_box":
-        raise ValueError(m.init)
-    lo = torch.full((3,), float(m.box[0]), device=device)
-    hi = torch.full((3,), float(m.box[1]), device=device)
-    spacing = float(torch.prod(hi - lo)) ** (1 / 3) / m.n ** (1 / 3)
-    return Gaussians.random_box(m.n, lo, hi, scale=m.scale_factor * spacing, opacity=m.opacity,
-                                generator=gen)
+def target(imgs, masks, i, bg):
+    """Float target image: the photo, or the photo composited onto bg with its mask."""
+    ref = imgs[i].float() / 255
+    if masks is None:
+        return ref, None
+    m = masks[i].float()[..., None] / 255
+    return m * ref + (1 - m) * bg, m[..., 0]
 
 
 @torch.no_grad()
-def evaluate(render_fn, model, cams, imgs, bg, idx, out_dir: Path | None = None, save_first: int = 0):
-    ps, ss = [], []
-    for j, i in enumerate(idx):
-        img, _, _ = render_fn(model, cams[i], bg)
-        ref = imgs[i].float() / 255
-        ps.append(psnr(img, ref).item())
-        ss.append(ssim(img.clamp(0, 1), ref).item())
-        if out_dir is not None and j < save_first:
-            pair = torch.cat([ref, img.clamp(0, 1)], 1)
-            iio.imwrite(out_dir / f"test_{i:03d}.png", (pair * 255 + 0.5).byte().cpu().numpy())
-    return float(np.mean(ps)), float(np.mean(ss))
+def foreground_points(points, cams, masks, min_inside: float = 0.8, min_views: int = 3):
+    """Keep SfM points that project inside the foreground mask in >= ``min_inside`` of the
+    training views where they are in frame (and in front of the camera)."""
+    from src.render_torch import project_points, world_to_camera
+    inside = torch.zeros(len(points), device=points.device)
+    seen = torch.zeros(len(points), device=points.device)
+    for cam, m in zip(cams, masks):
+        pc = world_to_camera(points, cam.viewmat)
+        uv = project_points(pc, cam.K)
+        u, v = uv[:, 0].long(), uv[:, 1].long()
+        ok = (pc[:, 2] > 0.1) & (u >= 0) & (u < cam.width) & (v >= 0) & (v < cam.height)
+        seen += ok
+        inside[ok] += (m[v[ok], u[ok]] > 127).float()
+    return (seen >= min_views) & (inside >= min_inside * seen.clamp(min=1))
 
 
+def init_model(cfg, data, device, gen) -> Gaussians:
+    m = cfg.model
+    sh = m.get("sh_degree", None)
+    if m.init == "sfm":
+        pts, cols = data["points"].to(device), data["colors"].to(device).float() / 255
+        if data["train_masks"] is not None and m.get("filter_points_with_masks", True):
+            keep = foreground_points(pts, data["train_cams"], data["train_masks"])
+            print(f"SfM init: {int(keep.sum())} of {len(pts)} points are on the foreground")
+            pts, cols = pts[keep], cols[keep]
+        return Gaussians.from_points(pts, cols, sh_degree=sh, opacity=m.opacity)
+    if m.init == "random_box":
+        if m.get("box") is not None:
+            lo = torch.full((3,), float(m.box[0]), device=device)
+            hi = torch.full((3,), float(m.box[1]), device=device)
+        else:       # bounding box of the foreground SfM points, enlarged by box_margin
+            pts = data["points"].to(device)
+            if data["train_masks"] is not None:
+                pts = pts[foreground_points(pts, data["train_cams"], data["train_masks"])]
+            lo_q, hi_q = torch.quantile(pts, 0.005, 0), torch.quantile(pts, 0.995, 0)
+            pad = (hi_q - lo_q) * m.get("box_margin", 0.1)
+            lo, hi = lo_q - pad, hi_q + pad
+            print(f"random box init: {lo.tolist()} -> {hi.tolist()}")
+        spacing = float(torch.prod(hi - lo)) ** (1 / 3) / m.n ** (1 / 3)
+        return Gaussians.random_box(m.n, lo, hi, scale=m.scale_factor * spacing, opacity=m.opacity,
+                                    generator=gen, sh_degree=sh)
+    raise ValueError(m.init)
+
+
+# ----------------------------------------------------------------------------- evaluation
+class Evaluator:
+    """PSNR / SSIM / LPIPS(alex) on the composited test images, plus for masked captures
+    PSNR inside the mask only and the IoU of the rendered alpha (> 0.5) with the mask (> 0.5)."""
+
+    def __init__(self, use_lpips: bool, device):
+        self.lpips = None
+        if use_lpips:
+            import lpips
+            self.lpips = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+
+    @torch.no_grad()
+    def __call__(self, render_fn, model, data, bg, idx, sh_degree=None, out_dir=None, save_first=0):
+        rows = []
+        for j, i in enumerate(idx):
+            cam = data["test_cams"][i]
+            img, alpha, _ = render_fn(model, cam, bg, sh_degree)
+            img = img.clamp(0, 1)
+            ref, m = target(data["test_imgs"], data["test_masks"], i, bg)
+            r = {"psnr": psnr(img, ref).item(), "ssim": ssim(img, ref).item()}
+            if self.lpips is not None:
+                to = lambda x: x.permute(2, 0, 1)[None] * 2 - 1
+                r["lpips"] = self.lpips(to(img), to(ref)).item()
+            if m is not None:
+                fg = m > 0.5
+                r["psnr_masked"] = (-10 * torch.log10(((img - ref) ** 2)[fg].mean())).item()
+                a = alpha > 0.5
+                r["alpha_iou"] = ((a & fg).sum() / (a | fg).sum()).item()
+            rows.append(r)
+            if out_dir is not None and j < save_first:
+                pair = torch.cat([ref, img], 1)
+                iio.imwrite(out_dir / f"test_{i:03d}.png", (pair * 255 + 0.5).byte().cpu().numpy())
+        return {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+
+
+# ----------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/stage4_lego_torch.yaml")
@@ -126,29 +214,33 @@ def main(argv=None):
     tb = SummaryWriter(run_dir / "tb")
     tc = cfg.train
 
-    train_cams, train_imgs, test_cams, test_imgs = load_data(cfg, dev)
+    data = load_data(cfg, dev)
+    train_cams, test_cams = data["train_cams"], data["test_cams"]
     bg = torch.tensor(list(cfg.data.bg), device=dev)
     render_fn = get_renderer(cfg)
     gen = torch.Generator(device=dev).manual_seed(cfg.seed)
-    model = init_model(cfg, dev, gen)
     ckpt_path = run_dir / "ckpt.pt"
     ck = torch.load(ckpt_path, map_location=dev, weights_only=False) \
         if args.resume and ckpt_path.exists() else None
-    if ck is not None:
-        model = Gaussians.from_state_dict(ck["model"]).to(dev)    # N may have changed
+    model = Gaussians.from_state_dict(ck["model"]).to(dev) if ck is not None \
+        else init_model(cfg, data, dev, gen)
 
-    # One Adam per parameter tensor (what gsplat's strategies expect: they replace a tensor
-    # when Gaussians are added/removed and rewrite that optimizer's state accordingly).
+    # One Adam per parameter tensor (what densification expects: it replaces a tensor when
+    # Gaussians are added/removed and rewrites that optimizer's state accordingly).
     opts = {key: torch.optim.Adam([{"params": [model.params[key]], "lr": tc.lr[name], "name": key}],
-                                  eps=1e-15) for name, key in LR_KEYS.items()}
+                                  eps=1e-15)
+            for name, key in LR_KEYS.items() if key in model.params}
     gamma = (tc.means_lr_final / tc.lr.means) ** (1.0 / tc.iterations)
     strategy, strategy_state = make_strategy(cfg, train_cams)
     if strategy is not None:
         strategy.check_sanity(model.params, opts)
-    eval_idx = np.linspace(0, len(test_cams) - 1, cfg.data.eval_subset).round().astype(int).tolist()
+    lam_mask = tc.get("lambda_mask", 0.0)
+    sh_every = tc.get("sh_every", 1000)
+    sh_degree = lambda it: min(it // sh_every, model.sh_degree) if model.uses_sh else None
+    evaluator = Evaluator(cfg.get("eval", {}).get("lpips", False), dev)
+    eval_idx = np.linspace(0, len(test_cams) - 1, min(cfg.data.eval_subset, len(test_cams))).round().astype(int).tolist()
     view_gen = torch.Generator().manual_seed(cfg.seed)
     start, order, elapsed = 0, [], 0.0
-
     if ck is not None:
         for key, o in opts.items():
             o.load_state_dict(ck["optim"][key])
@@ -165,17 +257,21 @@ def main(argv=None):
                     "elapsed": elapsed, "view_gen": view_gen.get_state()}, tmp)
         tmp.replace(ckpt_path)          # atomic: an interruption never leaves a torn checkpoint
 
-    print(f"{len(model)} Gaussians, {len(train_cams)} train / {len(test_cams)} test views at "
-          f"{train_cams[0].width}x{train_cams[0].height}, backend={cfg.render.backend}")
+    print(f"{len(model)} Gaussians ({'SH degree ' + str(model.sh_degree) if model.uses_sh else 'RGB'}), "
+          f"{len(train_cams)} train / {len(test_cams)} test views at {train_cams[0].width}x"
+          f"{train_cams[0].height}, backend={cfg.render.backend}, masks={data['train_masks'] is not None}, "
+          f"lambda_mask={lam_mask}")
     torch.cuda.reset_peak_memory_stats()
     t_last = time.perf_counter()
     for it in range(start + 1, tc.iterations + 1):
         if not order:
             order = torch.randperm(len(train_cams), generator=view_gen).tolist()
         i = order.pop()
-        img, alpha, info = render_fn(model, train_cams[i], bg)
-        ref = train_imgs[i].float() / 255
+        img, alpha, info = render_fn(model, train_cams[i], bg, sh_degree(it))
+        ref, m = target(data["train_imgs"], data["train_masks"], i, bg)
         loss = photometric_loss(img, ref, tc.lambda_dssim)
+        if lam_mask > 0 and m is not None:
+            loss = loss + lam_mask * (alpha - m).abs().mean()
         if strategy is not None:
             strategy.step_pre_backward(model.params, opts, strategy_state, it, info["meta"])
         loss.backward()
@@ -185,8 +281,7 @@ def main(argv=None):
         opts["means"].param_groups[0]["lr"] = tc.lr.means * gamma ** it
         if strategy is not None:
             # After the optimizer step, as in gsplat's reference trainer: accumulate the
-            # screen-space gradient of means2d (kept on the non-leaf tensor), then every
-            # refine_every steps clone/split/prune and periodically reset opacities.
+            # screen-space gradient of means2d, then clone/split/prune/reset.
             strategy.step_post_backward(model.params, opts, strategy_state, it, info["meta"],
                                         packed=True)
 
@@ -205,29 +300,33 @@ def main(argv=None):
             tb.add_scalar("model/visible_gaussians", n_vis, it)
             tb.add_scalar("model/n_gaussians", len(model), it)
             tb.add_scalar("model/opacity_gt_1_255",
-                          int((torch.sigmoid(model.opacity_logits) > 1 / 255).sum()), it)
+                          int((torch.sigmoid(model.params["opacities"]) > 1 / 255).sum()), it)
             print(f"[{it:6d}] loss {loss.item():.4f}  {1e3 * dt:6.0f} ms/it  pairs {info['pairs'] / 1e6:5.1f}M  "
-                  f"visible {n_vis:7d}  N {len(model):8d}  peak {torch.cuda.max_memory_allocated() / 2**30:5.2f} GB", flush=True)
+                  f"visible {n_vis:7d}  N {len(model):8d}  peak {torch.cuda.max_memory_allocated() / 2**30:5.2f} GB",
+                  flush=True)
         if it % tc.eval_every == 0 or it == tc.iterations:
-            p, s = evaluate(render_fn, model, test_cams, test_imgs, bg, eval_idx)
-            tb.add_scalar("test/psnr", p, it)
-            tb.add_scalar("test/ssim", s, it)
-            print(f"[{it:6d}] test PSNR {p:.2f}  SSIM {s:.4f} (subset of {len(eval_idx)})", flush=True)
+            r = evaluator(render_fn, model, data, bg, eval_idx, sh_degree(it))
+            for k, v in r.items():
+                tb.add_scalar(f"test/{k}", v, it)
+            print(f"[{it:6d}] test " + "  ".join(f"{k} {v:.4f}" for k, v in r.items()) +
+                  f" (subset of {len(eval_idx)})", flush=True)
             t_last = time.perf_counter()        # don't bill evaluation to training time
         if it % tc.ckpt_every == 0 or it == tc.iterations:
             save_ckpt(it)
             t_last = time.perf_counter()
 
-    p, s = evaluate(render_fn, model, test_cams, test_imgs, bg, range(len(test_cams)),
-                    out_dir=run_dir / "renders", save_first=8)
-    o = torch.sigmoid(model.opacity_logits)
-    metrics = {"test_psnr": p, "test_ssim": s, "n_test_views": len(test_cams),
+    final = evaluator(render_fn, model, data, bg, range(len(test_cams)), sh_degree(tc.iterations),
+                      out_dir=run_dir / "renders", save_first=8)
+    o = torch.sigmoid(model.params["opacities"])
+    metrics = {**{f"test_{k}": v for k, v in final.items()}, "n_test_views": len(test_cams),
                "resolution": [train_cams[0].width, train_cams[0].height],
                "iterations": tc.iterations, "train_time_s": elapsed,
                "ms_per_iter_mean": 1e3 * elapsed / max(tc.iterations - start, 1) if start == 0 else None,
                "peak_mem_GB": torch.cuda.max_memory_allocated() / 2**30,
                "n_gaussians": len(model), "n_opacity_gt_1_255": int((o > 1 / 255).sum()),
-               "backend": cfg.render.backend,
+               "backend": cfg.render.backend, "init": cfg.model.init,
+               "colors": f"SH{model.sh_degree}" if model.uses_sh else "RGB",
+               "lambda_mask": lam_mask,
                "densify": cfg.get("densify", {}).get("strategy", "none")}
     write_metrics(run_dir, metrics)
     tb.close()

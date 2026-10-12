@@ -1,0 +1,5 @@
+_base_: stage7_B.yaml
+name: stage7_C_densify        # + my adaptive density control (with opacity reset)
+densify:
+  strategy: adc
+  opacity_reset: true
