@@ -1,0 +1,4 @@
+_base_: stage8_base.yaml
+name: stage8_adc_aa_1600       # standard ADC + anti-aliased rasterization (Mip-Splatting 2D filter)
+render:
+  antialiased: true
