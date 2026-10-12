@@ -1,0 +1,7 @@
+_base_: stage8_base.yaml
+name: stage8_absgs_1600        # AbsGS: densify on the per-pixel absolute gradient sum
+render:
+  absgrad: true
+densify:
+  absgrad: true
+  grow_grad2d: 0.0008          # gsplat's recommendation for absgrad (|grad| sums are larger)

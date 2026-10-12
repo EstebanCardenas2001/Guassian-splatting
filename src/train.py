@@ -51,9 +51,12 @@ def make_strategy(cfg, train_cams):
     if d["strategy"] == "gsplat_default":
         from gsplat.strategy import DefaultStrategy
         strategy = DefaultStrategy(**kw)
-    elif d["strategy"] == "adc":
+    elif d["strategy"] == "adc":                    # my 3DGS ADC (absgrad=true: AbsGS)
         from src.densify import ADC
         strategy = ADC(**kw)
+    elif d["strategy"] == "mcmc":                   # my 3DGS-MCMC, hard cap on N
+        from src.densify import MCMC
+        strategy = MCMC(**kw)
     else:
         raise ValueError(d["strategy"])
     centers = torch.stack([c.center for c in train_cams])
@@ -69,11 +72,12 @@ def get_renderer(cfg):
     else:
         raise ValueError(cfg.render.backend)
     eps2d, aa = cfg.render.eps2d, cfg.render.antialiased
+    extra = {"absgrad": True} if cfg.render.get("absgrad", False) else {}   # AbsGS statistic
 
     def render_fn(model, cam, bg, sh_degree=None):
         colors = model.colors_for(cam.viewmat, sh_degree)
         return render(*model.geometry(), colors, cam.viewmat, cam.K, cam.width, cam.height,
-                      bg=bg, eps2d=eps2d, antialiased=aa)
+                      bg=bg, eps2d=eps2d, antialiased=aa, **extra)
     return render_fn
 
 
@@ -95,20 +99,34 @@ def load_data(cfg, device) -> dict:
                "points": torch.as_tensor(c["points"]), "colors": torch.as_tensor(c["point_colors"])}
     else:
         raise ValueError(d.type)
-    for k in ("train_cams", "test_cams"):
+    # Evaluation set: the test split, optionally at another resolution (e.g. full res, so
+    # runs trained at different resolutions are compared on the same images).
+    eres = str(cfg.get("eval", {}).get("res", None) or d.get("res", ""))
+    if d.type == "colmap" and eres != str(d.res):
+        e = load_colmap(REPO_ROOT / d.path, res=eres, model=d.model, test_every=d.test_every,
+                        load_split="test")
+        out.update(eval_cams=e["test_cams"], eval_imgs=e["test_images"],
+                   eval_masks=e["test_masks"] if d.use_masks else None)
+    else:
+        out.update(eval_cams=out["test_cams"], eval_imgs=out["test_imgs"], eval_masks=out["test_masks"])
+    # Images live on the GPU as uint8 if they fit; otherwise in pinned CPU memory, copied
+    # asynchronously per step (data.cache = gpu | cpu).
+    cache = d.get("cache", "gpu")
+    for k in ("train_cams", "test_cams", "eval_cams"):
         out[k] = [cam.to(device) for cam in out[k]]
-    for k in ("train_imgs", "test_imgs", "train_masks", "test_masks"):
+    for k in ("train_imgs", "test_imgs", "train_masks", "test_masks", "eval_imgs", "eval_masks"):
         if out[k] is not None:
-            out[k] = out[k].to(device)
+            out[k] = out[k].to(device) if cache == "gpu" or k.startswith("eval") else out[k].pin_memory()
     return out
 
 
 def target(imgs, masks, i, bg):
     """Float target image: the photo, or the photo composited onto bg with its mask."""
-    ref = imgs[i].float() / 255
+    dev = bg.device
+    ref = imgs[i].to(dev, non_blocking=True).float() / 255
     if masks is None:
         return ref, None
-    m = masks[i].float()[..., None] / 255
+    m = masks[i].to(dev, non_blocking=True).float()[..., None] / 255
     return m * ref + (1 - m) * bg, m[..., 0]
 
 
@@ -138,7 +156,8 @@ def init_model(cfg, data, device, gen) -> Gaussians:
             keep = foreground_points(pts, data["train_cams"], data["train_masks"])
             print(f"SfM init: {int(keep.sum())} of {len(pts)} points are on the foreground")
             pts, cols = pts[keep], cols[keep]
-        return Gaussians.from_points(pts, cols, sh_degree=sh, opacity=m.opacity)
+        return Gaussians.from_points(pts, cols, sh_degree=sh, opacity=m.opacity,
+                                     scale_mult=m.get("scale_mult", 1.0))
     if m.init == "random_box":
         if m.get("box") is not None:
             lo = torch.full((3,), float(m.box[0]), device=device)
@@ -172,10 +191,10 @@ class Evaluator:
     def __call__(self, render_fn, model, data, bg, idx, sh_degree=None, out_dir=None, save_first=0):
         rows = []
         for j, i in enumerate(idx):
-            cam = data["test_cams"][i]
+            cam = data["eval_cams"][i]
             img, alpha, _ = render_fn(model, cam, bg, sh_degree)
             img = img.clamp(0, 1)
-            ref, m = target(data["test_imgs"], data["test_masks"], i, bg)
+            ref, m = target(data["eval_imgs"], data["eval_masks"], i, bg)
             r = {"psnr": psnr(img, ref).item(), "ssim": ssim(img, ref).item()}
             if self.lpips is not None:
                 to = lambda x: x.permute(2, 0, 1)[None] * 2 - 1
@@ -227,9 +246,17 @@ def main(argv=None):
 
     # One Adam per parameter tensor (what densification expects: it replaces a tensor when
     # Gaussians are added/removed and rewrites that optimizer's state accordingly).
-    opts = {key: torch.optim.Adam([{"params": [model.params[key]], "lr": tc.lr[name], "name": key}],
-                                  eps=1e-15)
+    if tc.get("optimizer", "adam") == "selective":
+        # gsplat's SelectiveAdam: moments/params of Gaussians not visible in this view are not
+        # touched (no decay of their moments either) - cheaper for large N.
+        from gsplat.optimizers import SelectiveAdam
+        make_opt = lambda p, lr, key: SelectiveAdam([{"params": [p], "lr": lr, "name": key}],
+                                                    eps=1e-15, betas=(0.9, 0.999))
+    else:
+        make_opt = lambda p, lr, key: torch.optim.Adam([{"params": [p], "lr": lr, "name": key}], eps=1e-15)
+    opts = {key: make_opt(model.params[key], tc.lr[name], key)
             for name, key in LR_KEYS.items() if key in model.params}
+    selective = tc.get("optimizer", "adam") == "selective"
     gamma = (tc.means_lr_final / tc.lr.means) ** (1.0 / tc.iterations)
     strategy, strategy_state = make_strategy(cfg, train_cams)
     if strategy is not None:
@@ -239,6 +266,7 @@ def main(argv=None):
     sh_degree = lambda it: min(it // sh_every, model.sh_degree) if model.uses_sh else None
     evaluator = Evaluator(cfg.get("eval", {}).get("lpips", False), dev)
     eval_idx = np.linspace(0, len(test_cams) - 1, min(cfg.data.eval_subset, len(test_cams))).round().astype(int).tolist()
+    print(f"evaluation at {data['eval_cams'][0].width}x{data['eval_cams'][0].height}")
     view_gen = torch.Generator().manual_seed(cfg.seed)
     start, order, elapsed = 0, [], 0.0
     if ck is not None:
@@ -272,18 +300,26 @@ def main(argv=None):
         loss = photometric_loss(img, ref, tc.lambda_dssim)
         if lam_mask > 0 and m is not None:
             loss = loss + lam_mask * (alpha - m).abs().mean()
+        if tc.get("opacity_reg", 0) > 0:          # MCMC: L1 on opacity and scale
+            loss = loss + tc.opacity_reg * torch.sigmoid(model.params["opacities"]).mean()
+        if tc.get("scale_reg", 0) > 0:
+            loss = loss + tc.scale_reg * torch.exp(model.params["scales"]).mean()
         if strategy is not None:
             strategy.step_pre_backward(model.params, opts, strategy_state, it, info["meta"])
         loss.backward()
+        visible = info["radii"] > 0
         for o in opts.values():
-            o.step()
+            o.step(visible) if selective else o.step()
             o.zero_grad(set_to_none=True)
-        opts["means"].param_groups[0]["lr"] = tc.lr.means * gamma ** it
+        lr_means = tc.lr.means * gamma ** it
+        opts["means"].param_groups[0]["lr"] = lr_means
         if strategy is not None:
             # After the optimizer step, as in gsplat's reference trainer: accumulate the
-            # screen-space gradient of means2d, then clone/split/prune/reset.
+            # screen-space gradient of means2d, then clone/split/prune/reset (ADC) or
+            # relocate/add/noise (MCMC, which needs the current position LR).
+            kw = {"lr": lr_means} if cfg.get("densify", {}).get("strategy") == "mcmc" else {}
             strategy.step_post_backward(model.params, opts, strategy_state, it, info["meta"],
-                                        packed=True)
+                                        packed=True, **kw)
 
         if it % tc.log_every == 0:
             torch.cuda.synchronize()
@@ -327,6 +363,8 @@ def main(argv=None):
                "backend": cfg.render.backend, "init": cfg.model.init,
                "colors": f"SH{model.sh_degree}" if model.uses_sh else "RGB",
                "lambda_mask": lam_mask,
+               "eval_resolution": [data["eval_cams"][0].width, data["eval_cams"][0].height],
+               "antialiased": cfg.render.antialiased,
                "densify": cfg.get("densify", {}).get("strategy", "none")}
     write_metrics(run_dir, metrics)
     tb.close()

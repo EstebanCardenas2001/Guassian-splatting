@@ -1,0 +1,7 @@
+_base_: stage7_D.yaml          # SfM init, mask loss, SH 0->3, my ADC with reset
+name: stage8_base
+eval:
+  lpips: true
+  res: full                    # every run scored on the same 3024x4032 test photos
+train:
+  eval_every: 3000

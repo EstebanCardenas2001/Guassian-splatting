@@ -132,7 +132,7 @@ class Gaussians(nn.Module):
 
     @classmethod
     def from_points(cls, xyz: Tensor, rgb: Tensor, sh_degree: int | None = None,
-                    opacity: float = 0.1) -> "Gaussians":
+                    opacity: float = 0.1, scale_mult: float = 1.0) -> "Gaussians":
         """3DGS initialization from a point cloud (e.g. SfM): one isotropic Gaussian per
         point with scale = RMS distance to its 3 nearest neighbours, identity rotation,
         constant opacity, the point's color (RGB logits, or SH degree 0 with zero higher
@@ -140,7 +140,7 @@ class Gaussians(nn.Module):
         from scipy.spatial import cKDTree
         pts = xyz.detach().cpu().double().numpy()
         d, _ = cKDTree(pts).query(pts, k=4)                   # self + 3 neighbours
-        scale = torch.from_numpy((d[:, 1:] ** 2).mean(1).clip(min=1e-14) ** 0.5).float()
+        scale = scale_mult * torch.from_numpy((d[:, 1:] ** 2).mean(1).clip(min=1e-14) ** 0.5).float()
         dev = xyz.device
         n = len(xyz)
         quats = torch.zeros(n, 4, device=dev)

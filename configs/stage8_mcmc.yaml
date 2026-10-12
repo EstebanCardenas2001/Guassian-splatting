@@ -1,0 +1,12 @@
+_base_: stage8_base.yaml
+name: stage8_mcmc1m_1600       # 3DGS-MCMC with a hard cap
+model:
+  opacity: 0.5                 # 3DGS-MCMC init
+  scale_mult: 0.1
+densify:
+  strategy: mcmc
+  cap_max: 1000000
+  refine_stop_iter: 25000
+train:
+  opacity_reg: 0.01
+  scale_reg: 0.01

@@ -162,7 +162,8 @@ def load_blender(scene_dir, split: str, downscale: int = 1, bg=(1.0, 1.0, 1.0)
 
 def load_colmap(scene_dir, res: str = "1600", model: str = "colmap_incremental/sparse/1",
                 undistorted: str = "undistorted", test_every: int = 8, normalize: bool = True,
-                target_radius: float = 4.0, load_images: bool = True) -> dict:
+                target_radius: float = 4.0, load_images: bool = True,
+                load_split: str | None = None) -> dict:
     """COLMAP reconstruction + undistorted images/masks (``scripts/undistort_plant.py``).
 
     Poses: COLMAP's ``cam_from_world`` is already world-to-camera in the OpenCV convention,
@@ -182,6 +183,9 @@ def load_colmap(scene_dir, res: str = "1600", model: str = "colmap_incremental/s
     Returns dict: train_cams, test_cams (lists of Camera), train/test_images (N, H, W, 3)
     uint8, train/test_masks (N, H, W) uint8 (255 = foreground), points (P, 3) float32 and
     point_colors (P, 3) uint8 in the (normalized) world frame, normalization (c, R, s).
+    ``load_split`` ("train" / "test") reads the images of that split only (the other split's
+    image entries are then None), e.g. to evaluate at full resolution without decoding
+    all 216 photos.
     """
     import json
     from pathlib import Path
@@ -215,25 +219,30 @@ def load_colmap(scene_dir, res: str = "1600", model: str = "colmap_incremental/s
         pts = s * (pts - c) @ Rn.T
 
     cams, imgs, masks = [], [], []
-    for R, t, im in zip(Rs, ts, images):
+    test_idx = set(range(0, len(images), test_every))
+    for j, (R, t, im) in enumerate(zip(Rs, ts, images)):
         V = np.eye(4)
         V[:3, :3] = R @ Rn.T
         V[:3, 3] = s * (R @ c + t)
         cams.append(Camera(torch.tensor(V, dtype=torch.float32), K.clone(), W, H, name=im.name))
-        if load_images:
+        wanted = load_split is None or (load_split == "test") == (j in test_idx)
+        if load_images and wanted:
             imgs.append(torch.from_numpy(np.asarray(Image.open(scene_dir / undistorted / f"images_{res}" / im.name).convert("RGB"))))
             masks.append(torch.from_numpy(np.asarray(Image.open(
                 scene_dir / undistorted / f"masks_{res}" / Path(im.name).with_suffix(".png")).convert("L"))))
 
-    test_idx = set(range(0, len(cams), test_every))
     split = lambda xs, test: [x for i, x in enumerate(xs) if (i in test_idx) == test]
     out = {"train_cams": split(cams, False), "test_cams": split(cams, True),
            "points": pts.astype(np.float32), "point_colors": cols,
            "normalization": {"center": c.tolist(), "rotation": Rn.tolist(), "scale": float(s)}}
     if load_images:
         for name, xs in (("images", imgs), ("masks", masks)):
-            out[f"train_{name}"] = torch.stack(split(xs, False))
-            out[f"test_{name}"] = torch.stack(split(xs, True))
+            if load_split is None:
+                out[f"train_{name}"] = torch.stack(split(xs, False))
+                out[f"test_{name}"] = torch.stack(split(xs, True))
+            else:
+                out[f"{load_split}_{name}"] = torch.stack(xs)
+                out[f"{'train' if load_split == 'test' else 'test'}_{name}"] = None
     return out
 
 
