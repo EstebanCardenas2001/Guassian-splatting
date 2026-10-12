@@ -48,15 +48,24 @@ def make_strategy(cfg, train_cams):
     if cfg.render.backend != "gsplat":
         raise ValueError("densification needs the gsplat backend's meta (screen-space means)")
     kw = {k: v for k, v in d.items() if k not in ("strategy", "scene_scale")}
+    if d["strategy"] in ("adc", "mcmc"):
+        # configs inherit densify options from their base; keep only this strategy's fields
+        import dataclasses
+        from src.densify import ADC, MCMC
+        fields = {f.name for f in dataclasses.fields(ADC if d["strategy"] == "adc" else MCMC)}
+        dropped = sorted(set(kw) - fields)
+        if dropped:
+            print(f"densify: ignoring options not used by {d['strategy']}: {dropped}")
+        kw = {k: v for k, v in kw.items() if k in fields}
     if d["strategy"] == "gsplat_default":
         from gsplat.strategy import DefaultStrategy
-        strategy = DefaultStrategy(**kw)
+        strategy = DefaultStrategy(**accepted(DefaultStrategy))
     elif d["strategy"] == "adc":                    # my 3DGS ADC (absgrad=true: AbsGS)
         from src.densify import ADC
-        strategy = ADC(**kw)
+        strategy = ADC(**accepted(ADC))
     elif d["strategy"] == "mcmc":                   # my 3DGS-MCMC, hard cap on N
         from src.densify import MCMC
-        strategy = MCMC(**kw)
+        strategy = MCMC(**accepted(MCMC))
     else:
         raise ValueError(d["strategy"])
     centers = torch.stack([c.center for c in train_cams])

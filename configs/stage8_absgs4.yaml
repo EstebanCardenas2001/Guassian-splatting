@@ -1,4 +1,4 @@
 _base_: stage8_absgs.yaml
-name: stage8_absgs4_1600       # AbsGS with a lower threshold (0.0008 grew too few Gaussians)
+name: stage8_absgs4e-4_1600    # AbsGS with the paper's threshold (0.0008 grew only 141k Gaussians)
 densify:
   grow_grad2d: 0.0004
