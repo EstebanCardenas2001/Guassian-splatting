@@ -653,6 +653,87 @@ and my ADC with reset (34.15 dB).
 
 ---
 
+## Stage 6: Plant data pipeline
+
+**Capture.** 216 JPEGs from an iPhone 15 Pro main camera in ~44 mm-equivalent crop mode
+(EXIF: 6.765 mm f/1.78, FocalLengthIn35mmFilm = 44), 3024×4032 portrait, ISO 50,
+1/128 s on every frame (locked exposure), white balance "auto" in EXIF. Taken in 11 minutes
+on a wooden table in a furnished room. None flagged as blurred (Laplacian-variance
+sharpness: min 37 vs median 79).
+
+**Preparation** ([`scripts/prepare_plant.py`](../scripts/prepare_plant.py)). The EXIF
+rotation is applied to the pixels (COLMAP ignores the flag), files are renamed `frame_XXX`
+in capture order, and area-filtered 2000 px (1500×2000) and 1600 px (1200×1600) copies are
+written. With pixel origin at the corner, downscaling by s maps u′ = s·u exactly, so
+K′ = diag(s, s, 1)·K.
+
+**Structure from motion** ([`scripts/run_colmap.sh`](../scripts/run_colmap.sh)).
+* Ubuntu's COLMAP 3.12 is CPU-only: extraction took 89 s and matching ran at ~4.7 min per
+  50×50 block, an estimated 60–70 min. That run was stopped.
+* conda-forge's COLMAP 4.2.1 `cuda_129` build runs on the T4 under driver 580. Its package
+  is missing the OpenImageIO 3.1 dependency, which I installed by hand. It lives in its own
+  env `colmap`.
+* Settings: one shared OPENCV camera (fx, fy, cx, cy, k₁, k₂, p₁, p₂), 8192 SIFT features
+  per image, exhaustive matching of all 23,220 pairs with guided matching.
+
+| | global mapper (GLOMAP) | incremental mapper |
+|---|---|---|
+| extract / match (GPU) | 12 s / 432 s | (same database) |
+| mapping | 160 s | 685 s (CPU) |
+| registered | 216 / 216 | 216 / 216 (+ a 4-image fragment, ignored) |
+| 3D points | 101,094 | **144,497** |
+| mean track length | 6.0 | 5.5 |
+| mean reprojection error | 1.45 px | **1.01 px** |
+| fx, fy (2000 px) | 2590, 2592 | 2592, 2594 |
+| k₁, k₂, p₁, p₂ | 0.180, −0.437, 0.0003, 0.0011 | 0.171, −0.411, 0.0003, 0.0015 |
+
+The two independent solutions agree on the intrinsics, so the residual distortion is real
+(about 23 px at the corners). The focal length matches the EXIF 44 mm-equivalent:
+44 / 43.3 × 2500 px (diagonal) ≈ 2540 px. **The incremental model is used** (lower error,
+43 % more points for initialization). For larger captures the global mapper is 4× faster;
+a final bundle adjustment should bring its error down (to be tested).
+
+**Masks** ([`scripts/make_masks.py`](../scripts/make_masks.py)). BiRefNet
+(`birefnet-general` via rembg, 973 MB weights in `/mnt/cache/u2net`). The rembg dependency
+pulled onnxruntime-gpu 1.31, which needs CUDA 13 (`libcublasLt.so.13`) and so silently fell
+back to the CPU (23 s/image). onnxruntime-gpu **1.26.0** is the newest CUDA-12 build; it
+reuses PyTorch's cu126 cuBLAS/cuDNN via `ort.preload_dlls()`. That gives **1.5 s/image**,
+and masks identical to the CPU ones (max |Δ| = 1/255, 0 % disagreement after
+thresholding). All 216 masks took 6.4 min.
+
+**Undistortion** ([`scripts/undistort_plant.py`](../scripts/undistort_plant.py)).
+OPENCV → pinhole via `cv2.initUndistortRectifyMap` + `remap`, using
+`getOptimalNewCameraMatrix(alpha=0)` (no invalid corners). That gives a 1.8 % longer focal
+length: 2592 → 2638 px at 2000 px. One model serves all resolutions (distortion
+coefficients are dimensionless; K scales with s). Images and masks share the same mapping.
+
+**Loader** (`camera.load_colmap`). COLMAP's `cam_from_world` is our `viewmat` (OpenCV
+convention). Every 8th image is held out (27 test / 189 train). Normalization
+x′ = s R (x − c):
+* c is the point closest to all optical axes (least squares);
+* R rotates the mean camera up onto +y;
+* s sets the mean camera distance to 4.
+
+Viewmats become [R_wc Rᵀ | s(R_wc c + t)], which leaves every projection unchanged.
+
+**Verification** ([`tests/test_colmap.py`](../tests/test_colmap.py)). Projecting all 793,519
+COLMAP observations with my `world_to_camera` + `project_points` into the undistorted
+camera, against the measured keypoints undistorted with the same model, gives a mean error
+of **1.04 px** (median 0.81 px, 95th percentile 2.75 px), vs COLMAP's reported 1.01 px.
+Normalization moves visible points by < 0.01 px. (Points behind or on the camera plane
+project ~10⁵ px off-image, where float32 error is amplified; the renderer culls them.)
+
+**Interactive check:** `python -m scripts.viser_scene`, then open http://localhost:8080
+(point cloud + textured camera frustums; click a frustum to fly to its view).
+
+![Cameras](figures/stage6_cameras.png)
+
+![Reprojection](figures/stage6_reprojection.png)
+
+![Masks](figures/stage6_masks.png)
+
+---
+
 ## Repository layout
 
 ```

@@ -73,6 +73,7 @@ density control** adds Gaussians where the image is still wrong and removes usel
 | 3 | recover 200 known Gaussians | exact from a near start; 81 % from a random start, **97.5 %** with 2× Gaussians |
 | 4 | lego with my renderer | **27.9 dB** at 400²; breaks at ~80 M pixel–Gaussian pairs (memory) |
 | 5 | gsplat CUDA rasterizer + my densification | **34.15 dB** at 800² (target ≳ 32), 15 min, 0.8 GB |
+| 6 | plant data pipeline (all on GPU) | 216/216 photos posed in ~10 min; my projection matches COLMAP to 1.04 px |
 
 All numbers are on held-out views and come from runs logged under `outputs/` (config, git
 commit, metrics). The full tables are in [`docs/DETAILED_NOTES.md`](docs/DETAILED_NOTES.md).
@@ -210,6 +211,40 @@ Two findings worth keeping:
 * **Without the reset, growth is unstable:** one of four reset-off runs ran away to 920k
   Gaussians. With the reset, the two runs end within 1 % of each other.
 
+### Stage 6 — The plant: photos → camera poses → masks
+
+216 photos of the pothos, taken with an iPhone 15 Pro (44 mm-equivalent, locked exposure),
+walking around the plant ([capture guide](docs/CAPTURE_GUIDE.md)).
+
+1. **Preparation.** The photos are rotated upright (iOS stores portrait as a flag that
+   COLMAP ignores) and resized to 2000 and 1600 px with area filtering, so the
+   intrinsics scale exactly: K′ = s·K.
+2. **Camera poses with COLMAP**, structure-from-motion on the GPU (COLMAP 4.2.1 built with
+   CUDA, from conda-forge):
+
+   | step | CPU (Ubuntu COLMAP) | GPU |
+   |---|---|---|
+   | SIFT features | 89 s | **12 s** |
+   | matching all 23,220 image pairs | ~60–70 min | **7 min** |
+
+   **All 216 photos registered** (target ≥ 95 %), 144k 3D points, mean reprojection error
+   **1.0 px**. The lens still has some distortion after iOS's own correction (k₁ = 0.17,
+   ~23 px in the corners), so every image and mask is resampled to an ideal pinhole camera.
+3. **Masks** (plant + pot + saucer) with BiRefNet, on the GPU: **1.5 s per image** instead
+   of 23 s on the CPU, with identical masks. Thin stems and gaps between leaves are kept.
+4. **Loader.** Every 8th photo is held out for testing (27 test, 189 train). The scene is
+   normalized (plant at the origin, up = +y, cameras at a mean distance of 4, like the
+   lego) so the Stage 5 settings carry over.
+
+**Check:** projecting all 793k points COLMAP matched with *my* camera code reproduces
+COLMAP's measurements to 1.04 px on average (COLMAP's own figure: 1.01 px).
+
+![Cameras](docs/figures/stage6_cameras.png)
+
+![Reprojection](docs/figures/stage6_reprojection.png)
+
+![Masks](docs/figures/stage6_masks.png)
+
 ---
 
 ## 4. Lessons so far
@@ -226,8 +261,6 @@ Two findings worth keeping:
 
 ## 5. Next
 
-* **Stage 6:** plant photos → COLMAP camera poses → foreground masks → data loader.
-  How to take the photos: [`docs/CAPTURE_GUIDE.md`](docs/CAPTURE_GUIDE.md).
 * **Stage 7:** plant training, one feature at a time (mask loss, densification, spherical
   harmonics for view-dependent leaf sheen, SfM vs random initialization).
 * **Stage 8:** push resolution and Gaussian count to the T4's limits (AbsGS, 3DGS-MCMC,
@@ -241,7 +274,7 @@ Two findings worth keeping:
 ```bash
 bash scripts/setup_env.sh               # conda env "gsplat" on /mnt (once)
 conda activate gsplat
-pytest                                  # 43 tests: renderers, gradcheck, densification
+pytest                                  # 48 tests: renderers, gradcheck, densification, COLMAP loader
 python -m src.fit2d model.n=20000       # Stage 1
 python -m src.train --config configs/stage5_lego_adc.yaml   # lego, 800², my densification (~15 min)
 bash scripts/tensorboard.sh             # TensorBoard on :6006
@@ -256,7 +289,7 @@ interrupted run.
 | file | what it does |
 |---|---|
 | [`src/gaussians.py`](src/gaussians.py) | parameters, activations, quaternion → R, Σ = R S Sᵀ Rᵀ |
-| [`src/camera.py`](src/camera.py) | camera conventions (OpenCV), `look_at`, Blender loader |
+| [`src/camera.py`](src/camera.py) | camera conventions (OpenCV), `look_at`, Blender and COLMAP loaders |
 | [`src/render_torch.py`](src/render_torch.py) | my renderer: projection, EWA, culling |
 | [`src/rasterize.py`](src/rasterize.py) | my sparse depth-sorted compositing (shared by 2D and 3D) |
 | [`src/render_gsplat.py`](src/render_gsplat.py) | gsplat behind the same interface |
@@ -265,5 +298,6 @@ interrupted run.
 | [`src/train.py`](src/train.py) | training loop: per-parameter Adam, checkpoints, resume |
 | [`src/splat2d.py`](src/splat2d.py), [`src/fit2d.py`](src/fit2d.py) | Stage 1 (2D) |
 | [`src/synthetic.py`](src/synthetic.py), [`src/fit_synthetic.py`](src/fit_synthetic.py) | Stage 3 (inverse problem) |
+| [`scripts/run_colmap.sh`](scripts/run_colmap.sh), [`scripts/make_masks.py`](scripts/make_masks.py), [`scripts/undistort_plant.py`](scripts/undistort_plant.py) | Stage 6 data pipeline (GPU) |
 | [`tests/`](tests/) | pytest suite |
 | [`docs/DETAILED_NOTES.md`](docs/DETAILED_NOTES.md) | every table, profile and analysis, stage by stage |

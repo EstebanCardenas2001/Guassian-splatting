@@ -24,7 +24,8 @@ and **final quality** (sharp leaf edges, thin stems, terracotta texture, view-de
 - gsplat 1.5.3 is a pure-Python wheel; its CUDA kernels JIT-compile on first use (~2 min, cached in
   `/mnt/cache/torch_extensions`). Needs the env's `CPATH` (conda-forge CUDA headers live under `targets/`).
   Smoke test: `python scripts/gsplat_smoke.py`.
-- COLMAP from apt (3.12.6, CPU-only build: use `--SiftExtraction.use_gpu 0 --SiftMatching.use_gpu 0`).
+- COLMAP: use the **GPU** build 4.2.1 in conda env `colmap` (`scripts/run_colmap.sh`); apt 3.12.6 is CPU-only (~9x slower).
+- Masks: BiRefNet via rembg on GPU needs onnxruntime-gpu==1.26.0 (newest CUDA-12 build) + `ort.preload_dlls()`.
 - Setup: `scripts/setup_env.sh`; sanity check: `python scripts/check_env.py`; TensorBoard: `scripts/tensorboard.sh`.
 - The VM can be interrupted: long jobs run in `tmux` and checkpoint regularly.
 
@@ -63,7 +64,7 @@ src/
   synthetic.py, fit_synthetic.py  Stage 3 GT scenes, recovery metrics, inverse problem
   config.py         YAML loading (+ _base_ inheritance, dotlist overrides)
   run.py            seeding, git provenance, run directories, metrics.json
-  camera.py         intrinsics/extrinsics, COLMAP + Blender loaders
+  camera.py         intrinsics/extrinsics, Blender + COLMAP loaders (load_colmap: undistorted, normalized, every-8th test)
   gaussians.py      parameter container, activations, init (SfM / random box)
   render_torch.py   pure-PyTorch reference renderer
   render_gsplat.py  wrapper around gsplat's rasterizer (Stage 5)
