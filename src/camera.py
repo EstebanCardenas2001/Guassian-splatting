@@ -158,3 +158,95 @@ def load_blender(scene_dir, split: str, downscale: int = 1, bg=(1.0, 1.0, 1.0)
         cams.append(Camera(torch.linalg.inv(c2w).float(), intrinsics_matrix(f, f, W / 2, H / 2),
                            W, H, name=Path(fr["file_path"]).name))
     return cams, torch.stack(imgs)
+
+
+def load_colmap(scene_dir, res: str = "1600", model: str = "colmap_incremental/sparse/1",
+                undistorted: str = "undistorted", test_every: int = 8, normalize: bool = True,
+                target_radius: float = 4.0, load_images: bool = True) -> dict:
+    """COLMAP reconstruction + undistorted images/masks (``scripts/undistort_plant.py``).
+
+    Poses: COLMAP's ``cam_from_world`` is already world-to-camera in the OpenCV convention,
+    x_cam = R x_world + t, i.e. exactly our ``viewmat``. Intrinsics: the undistorted pinhole
+    K for resolution ``res`` from ``<undistorted>/cameras.json``.
+    Split: images sorted by name, every ``test_every``-th (index 0, 8, 16, ...) held out.
+
+    Normalization (``normalize=True``) applies a similarity x' = s R (x - c) to the world:
+      * c: the point closest (least squares) to all optical axes - the object the cameras
+        look at:  sum_i (I - d_i d_i^T) c = sum_i (I - d_i d_i^T) o_i,
+      * R: rotates the mean camera "up" (-y_cam in world) onto +y,
+      * s: makes the mean camera distance to c equal ``target_radius`` (4, like the lego,
+        so learning rates and densification thresholds transfer).
+    Each viewmat becomes [R_wc R^T | s (R_wc c + t)]: scaling camera coordinates by s
+    doesn't change the projection, so every pixel stays exactly where it was.
+
+    Returns dict: train_cams, test_cams (lists of Camera), train/test_images (N, H, W, 3)
+    uint8, train/test_masks (N, H, W) uint8 (255 = foreground), points (P, 3) float32 and
+    point_colors (P, 3) uint8 in the (normalized) world frame, normalization (c, R, s).
+    """
+    import json
+    from pathlib import Path
+
+    import numpy as np
+    import pycolmap
+    from PIL import Image
+
+    scene_dir = Path(scene_dir)
+    rec = pycolmap.Reconstruction(str(scene_dir / model))
+    meta = json.loads((scene_dir / undistorted / "cameras.json").read_text())["resolutions"][res]
+    K = torch.tensor(meta["K"], dtype=torch.float32)
+    W, H = meta["width"], meta["height"]
+
+    images = sorted(rec.images.values(), key=lambda im: im.name)
+    Rs = np.stack([im.cam_from_world().rotation.matrix() for im in images])        # (N, 3, 3)
+    ts = np.stack([im.cam_from_world().translation for im in images])              # (N, 3)
+    pts = np.stack([p.xyz for p in rec.points3D.values()])
+    cols = np.stack([p.color for p in rec.points3D.values()]).astype(np.uint8)
+
+    c, Rn, s = np.zeros(3), np.eye(3), 1.0
+    if normalize:
+        origins = -np.einsum("nji,nj->ni", Rs, ts)                 # camera centers C = -R^T t
+        dirs = Rs[:, 2, :]                                         # optical axes (3rd row of R)
+        A = np.eye(3)[None] - dirs[:, :, None] * dirs[:, None, :]
+        c = np.linalg.solve(A.sum(0), np.einsum("nij,nj->i", A, origins))
+        up = -Rs[:, 1, :].mean(0)
+        up /= np.linalg.norm(up)
+        Rn = _rotation_between(up, np.array([0.0, 1.0, 0.0]))
+        s = target_radius / np.linalg.norm(origins - c, axis=1).mean()
+        pts = s * (pts - c) @ Rn.T
+
+    cams, imgs, masks = [], [], []
+    for R, t, im in zip(Rs, ts, images):
+        V = np.eye(4)
+        V[:3, :3] = R @ Rn.T
+        V[:3, 3] = s * (R @ c + t)
+        cams.append(Camera(torch.tensor(V, dtype=torch.float32), K.clone(), W, H, name=im.name))
+        if load_images:
+            imgs.append(torch.from_numpy(np.asarray(Image.open(scene_dir / undistorted / f"images_{res}" / im.name).convert("RGB"))))
+            masks.append(torch.from_numpy(np.asarray(Image.open(
+                scene_dir / undistorted / f"masks_{res}" / Path(im.name).with_suffix(".png")).convert("L"))))
+
+    test_idx = set(range(0, len(cams), test_every))
+    split = lambda xs, test: [x for i, x in enumerate(xs) if (i in test_idx) == test]
+    out = {"train_cams": split(cams, False), "test_cams": split(cams, True),
+           "points": pts.astype(np.float32), "point_colors": cols,
+           "normalization": {"center": c.tolist(), "rotation": Rn.tolist(), "scale": float(s)}}
+    if load_images:
+        for name, xs in (("images", imgs), ("masks", masks)):
+            out[f"train_{name}"] = torch.stack(split(xs, False))
+            out[f"test_{name}"] = torch.stack(split(xs, True))
+    return out
+
+
+def _rotation_between(a, b):
+    """Rotation matrix taking unit vector a onto unit vector b (Rodrigues)."""
+    import numpy as np
+    v, cth = np.cross(a, b), float(np.dot(a, b))
+    if np.linalg.norm(v) < 1e-12:
+        if cth > 0:
+            return np.eye(3)
+        # a = -b: rotate by 180 degrees about any axis perpendicular to a
+        axis = np.cross(a, [1.0, 0.0, 0.0] if abs(a[0]) < 0.9 else [0.0, 1.0, 0.0])
+        axis /= np.linalg.norm(axis)
+        return 2 * np.outer(axis, axis) - np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * (1 / (1 + cth))
