@@ -74,6 +74,7 @@ density control** adds Gaussians where the image is still wrong and removes usel
 | 4 | lego with my renderer | **27.9 dB** at 400²; breaks at ~80 M pixel–Gaussian pairs (memory) |
 | 5 | gsplat CUDA rasterizer + my densification | **34.15 dB** at 800² (target ≳ 32), 15 min, 0.8 GB |
 | 6 | plant data pipeline (all on GPU) | 216/216 photos posed in ~10 min; my projection matches COLMAP to 1.04 px |
+| 7 | plant training ablation A–E | **32.26 dB** (27.0 dB on the plant alone), LPIPS 0.030; spherical harmonics is the biggest single gain |
 
 All numbers are on held-out views and come from runs logged under `outputs/` (config, git
 commit, metrics). The full tables are in [`docs/DETAILED_NOTES.md`](docs/DETAILED_NOTES.md).
@@ -245,6 +246,40 @@ COLMAP's measurements to 1.04 px on average (COLMAP's own figure: 1.01 px).
 
 ![Masks](docs/figures/stage6_masks.png)
 
+### Stage 7 — Training on the plant, one feature at a time
+
+Five saved runs at 1600 px (189 training photos, 27 held out), each adding one feature.
+The photos are composited onto white with the masks, so only the plant and pot are
+reconstructed. Scores are on the 27 held-out photos; **"plant only"** is PSNR inside the
+mask, the honest number, since the white background is trivially easy.
+
+| run | adds | PSNR | plant only | SSIM | LPIPS ↓ | Gaussians | time |
+|---|---|---|---|---|---|---|---|
+| A | baseline: SfM points, RGB color | 30.55 | 24.99 | 0.967 | 0.0375 | 74k | 28 min |
+| B | + mask loss \|α − m\| | 30.53 | 24.96 | 0.967 | 0.0377 | 74k | 28 min |
+| C | + my densification | 30.87 | 25.48 | 0.970 | 0.0339 | 368k | 35 min |
+| **D** | **+ spherical harmonics (view-dependent color)** | **32.26** | **26.96** | **0.976** | **0.0304** | 390k | 41 min |
+| E | D with random initialization | 32.20 | 26.86 | 0.975 | 0.0323 | 327k | 40 min |
+
+![Stage 7 renders](docs/figures/stage7_renders.png)
+*A held-out view and two zooms. The waxy pothos leaves reflect the light: A–C (one
+fixed color per Gaussian) render them flat green, D–E reproduce the highlights.*
+
+* **Spherical harmonics is the biggest gain: +1.5 dB on the plant.** Each Gaussian's color
+  becomes a function of viewing direction, c(d) = Σ k_lm Y_lm(d) + ½ up to degree 3, which
+  can represent the specular sheen of the leaves.
+* **Densification helps less here than on the lego** (+0.5 dB). The SfM points already
+  start where the plant is, and the 1600 px images limit how much detail there is to add.
+* **The mask loss changes nothing measurable.** Against a white background the color
+  loss already penalizes anything non-white outside the plant, and the silhouette was
+  already 98.6 % correct (IoU of rendered α with the mask).
+* **Random initialization is almost as good as SfM** (−0.1 dB, slightly worse LPIPS):
+  densification recovers the structure, as Stage 3 suggested it would.
+* **What's still missing:** the fine variegation streaks are smoothed in every run. That
+  is Stage 8's job (higher resolution, more Gaussians, better densification).
+
+![Stage 7 curves](docs/figures/stage7_curves.png)
+
 ---
 
 ## 4. Lessons so far
@@ -261,8 +296,6 @@ COLMAP's measurements to 1.04 px on average (COLMAP's own figure: 1.01 px).
 
 ## 5. Next
 
-* **Stage 7:** plant training, one feature at a time (mask loss, densification, spherical
-  harmonics for view-dependent leaf sheen, SfM vs random initialization).
 * **Stage 8:** push resolution and Gaussian count to the T4's limits (AbsGS, 3DGS-MCMC,
   anti-aliasing).
 * **Stage 9:** evaluation, `.ply` export for SuperSplat, orbit video.
@@ -274,7 +307,7 @@ COLMAP's measurements to 1.04 px on average (COLMAP's own figure: 1.01 px).
 ```bash
 bash scripts/setup_env.sh               # conda env "gsplat" on /mnt (once)
 conda activate gsplat
-pytest                                  # 48 tests: renderers, gradcheck, densification, COLMAP loader
+pytest                                  # 54 tests: renderers, gradcheck, densification, COLMAP loader, SH
 python -m src.fit2d model.n=20000       # Stage 1
 python -m src.train --config configs/stage5_lego_adc.yaml   # lego, 800², my densification (~15 min)
 bash scripts/tensorboard.sh             # TensorBoard on :6006
@@ -294,6 +327,7 @@ interrupted run.
 | [`src/rasterize.py`](src/rasterize.py) | my sparse depth-sorted compositing (shared by 2D and 3D) |
 | [`src/render_gsplat.py`](src/render_gsplat.py) | gsplat behind the same interface |
 | [`src/densify.py`](src/densify.py) | my adaptive density control |
+| [`src/sh.py`](src/sh.py) | spherical harmonics (view-dependent color) |
 | [`src/losses.py`](src/losses.py) | L1, SSIM (matches scikit-image to 10⁻¹⁶), PSNR |
 | [`src/train.py`](src/train.py) | training loop: per-parameter Adam, checkpoints, resume |
 | [`src/splat2d.py`](src/splat2d.py), [`src/fit2d.py`](src/fit2d.py) | Stage 1 (2D) |

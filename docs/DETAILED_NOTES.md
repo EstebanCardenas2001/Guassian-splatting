@@ -734,6 +734,74 @@ project ~10⁵ px off-image, where float32 error is amplified; the renderer cull
 
 ---
 
+## Stage 7: Plant training ablation
+
+Code: [`src/train.py`](../src/train.py) (COLMAP data, masked targets, mask loss, SH schedule,
+evaluator), [`src/sh.py`](../src/sh.py), [`src/gaussians.py`](../src/gaussians.py)
+(`from_points`, SH parameters), configs [`configs/stage7_*.yaml`](../configs/),
+[`scripts/stage7_sweep.sh`](../scripts/stage7_sweep.sh),
+[`scripts/plot_stage7.py`](../scripts/plot_stage7.py).
+
+**Setup common to all runs.**
+* Undistorted 1200×1600 images; 189 train / 27 test (every 8th); normalized scene (camera
+  radius 4).
+* Target I* = m·photo + (1 − m)·white, rendered against white.
+* L = 0.8·L1 + 0.2·(1 − SSIM) (+ λ·|α − m| in B–E, λ = 0.1).
+* 30k iterations, Stage 4/5 learning rates (SH: sh0 2.5·10⁻³, shN 1.25·10⁻⁴), gsplat
+  backend.
+
+**Initialization.**
+* SfM points kept only if they project inside the mask in ≥ 80 % of the training views
+  where they are in frame (≥ 3 views): **73,744 of 144,497** points (the rest are table and
+  room).
+* Scale = RMS distance to the 3 nearest neighbours, identity rotation, opacity 0.1, color
+  from the point.
+* E: 100k uniform random Gaussians in the bounding box of the foreground points (0.5–99.5 %
+  quantiles + 10 % margin), scale 0.7 × spacing.
+
+**Spherical harmonics.**
+c(d) = max(0, Σ_{l≤L} Σ_m k_lm Y_lm(d) + ½), with d the unit direction from the camera
+center to the mean.
+* Real orthonormal basis, same constants and order as 3DGS/gsplat. Tested against gsplat
+  (degrees 0–3, 10⁻⁵) and for orthonormality by Monte Carlo (2M directions,
+  ∫Y_iY_j dΩ = δ_ij within 6·10⁻³).
+* Degree raised by one every 1000 iterations up to 3: 48 coefficients per Gaussian.
+* Init: k₀₀ = (c − ½)/C₀, higher coefficients 0.
+
+**Metrics (all 27 test views).** PSNR/SSIM on the composited image; LPIPS-AlexNet (inputs
+in [−1, 1]); PSNR restricted to mask > 0.5; IoU of rendered α > 0.5 with mask > 0.5.
+
+| run | PSNR | PSNR (mask) | SSIM | LPIPS | α IoU | Gaussians | time | ms/it |
+|---|---|---|---|---|---|---|---|---|
+| A baseline | 30.55 | 24.99 | 0.9674 | 0.0375 | 0.9861 | 73,744 | 28 min | 56 |
+| B + mask loss | 30.53 | 24.96 | 0.9674 | 0.0377 | 0.9864 | 73,744 | 28 min | 56 |
+| C + ADC (with reset) | 30.87 | 25.48 | 0.9702 | 0.0339 | 0.9862 | 368,298 | 35 min | 71 |
+| D + SH 0→3 | **32.26** | **26.96** | **0.9757** | **0.0304** | 0.9869 | 389,537 | 41 min | 83 |
+| E = D, random-box init | 32.20 | 26.86 | 0.9749 | 0.0323 | 0.9868 | 326,589 | 40 min | 81 |
+
+**Readings.**
+* **SH (+1.48 dB on the plant)** is the largest effect. The zooms show the leaves' specular
+  sheen, absent from A–C and present in D–E. Part of the gain may also come from the
+  iPhone's per-photo processing (white balance is "auto" in EXIF): low-order SH can
+  partially absorb view-correlated color shifts. Separating the two would need a
+  per-image appearance model (a candidate for Stage 8).
+* **ADC (+0.49 dB)** grows 74k → 368k Gaussians by 15k iterations, with the same reset
+  dips as in Stage 5.
+* **The mask loss (±0.03 dB, IoU +0.0003)** has no measurable effect. With a white
+  composited target, any non-white Gaussian outside the plant is already penalized by the
+  color loss, and A's silhouette IoU was already 0.986. A random background color per
+  iteration would make the mask term matter; not pursued, since nothing is broken.
+* **Random init (E)** is within 0.1 dB of SfM init. It first prunes 100k → 16k at the first
+  refinement and then densifies to 327k; LPIPS is slightly worse (0.0323 vs 0.0304).
+* The curves dip at every opacity reset (3k, 6k, 9k, 12k): an evaluation artifact, as in
+  Stage 5.
+
+![Renders](figures/stage7_renders.png)
+
+![Curves](figures/stage7_curves.png)
+
+---
+
 ## Repository layout
 
 ```

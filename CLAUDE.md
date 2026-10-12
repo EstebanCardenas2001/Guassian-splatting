@@ -70,6 +70,7 @@ src/
   render_gsplat.py  wrapper around gsplat's rasterizer (Stage 5)
   losses.py         L1, D-SSIM, mask/opacity losses
   densify.py        my ADC (clone/split/prune, opacity reset); == gsplat DefaultStrategy w/o reset
+  sh.py             real spherical harmonics up to degree 3 (view-dependent color)
   train.py          generic trainer (Blender now, COLMAP later): per-param LRs, resume
   evaluate.py       PSNR / SSIM / LPIPS, render test views
   export.py         .ply in standard 3DGS layout, fly-through video
