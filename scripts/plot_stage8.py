@@ -67,8 +67,6 @@ def main():
         print(f"| {res} | {r['method']} | {r['cap']} | {'✓' if r['aa'] else ''} | {r['iters'] // 1000}k | "
               f"{r['psnr']:.2f} | {r['psnr_masked']:.2f} | {r['ssim']:.4f} | {r['lpips']:.4f}{star} | "
               f"{r['n'] / 1e3:.0f}k | {r['vram']:.1f} GB{'*' if r['vram_incl_eval'] else ''} | {its} | {r['minutes']:.0f} min |")
-    print("\n\\* peak includes the periodic full-resolution evaluation (12 MP renders + LPIPS), "
-          "not only training; runs without * report the training-only peak.")
     print(f"\nbest (LPIPS): {best['run'].name}")
 
     # ---- full-res crops: GT + selected runs, one test view, two detail windows
@@ -96,7 +94,8 @@ def main():
         if all(abs(y - yy) > s or abs(x - xx) > s for yy, xx in wins):
             wins.append((y, x)); break
     cols = [("ground truth (full res)", gt)] + [
-        (f"{r['res']} · {r['method']}{' · AA' if r['aa'] else ''}\nLPIPS {r['lpips']:.4f}", load(r)[1]) for r in pick]
+        (f"{r['res']} · {r['method']}{' · AA' if r['aa'] else ''} · {r['iters'] // 1000}k\nLPIPS {r['lpips']:.4f}",
+         load(r)[1]) for r in pick]
     fig, axes = plt.subplots(2, len(cols), figsize=(2.9 * len(cols), 6.4), dpi=160)
     for c, (t, img) in enumerate(cols):
         for r_, (y, x) in enumerate(wins):

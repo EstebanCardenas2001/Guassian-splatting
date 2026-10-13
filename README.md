@@ -19,7 +19,7 @@ from 216 phone photos on one NVIDIA T4 (16 GB).
 | 5 | gsplat CUDA rasterizer + my densification | **lego 34.15 dB at 800²** in 15 min |
 | 6 | plant: poses, masks, loader (all GPU) | 216/216 photos posed in 10 min, 1.0 px error |
 | 7 | plant ablation (5 runs) | **32.3 dB, LPIPS 0.030** (best: + spherical harmonics) |
-| 8 | push the T4 to maximum detail | *in progress* |
+| 8 | push the T4: densification × resolution × schedule | **LPIPS 0.0628 at full res** (2000 px, 60k it., 4.8 GB, 2 h) |
 
 All metrics are on held-out views. Every number comes from a logged run (config, git
 commit, metrics) and is detailed in **[docs/DETAILED_NOTES.md](docs/DETAILED_NOTES.md)**.
@@ -63,10 +63,16 @@ as **Σ = R(q) diag(s²) R(q)ᵀ**, which stays positive semi-definite under any
 * **Plant (7).** Spherical harmonics gave the largest gain (+1.5 dB on the plant, the
   leaf sheen). The mask loss had no measurable effect against a white background.
   Random initialization comes within 0.1 dB of SfM initialization.
+* **Maximum detail (8).** Every run is scored on the full-resolution photos. Training
+  resolution and schedule matter far more than the densification method: AbsGS ties the
+  3DGS rules, and MCMC wins PSNR but loses LPIPS (smoother texture). 2000 px × 60k
+  iterations is the best LPIPS (0.0628) and beats full-resolution training in 62 % of the
+  time. Anti-aliasing doesn't blur edges, and every configuration trains in ≤ 5.2 GB:
+  time, not memory, is the limit on a T4.
 
-<p align="center"><img src="docs/figures/stage7_renders.png" width="900"><br>
-<em>Plant ablation on a held-out view. Zooms: only runs with spherical harmonics (D, E)
-reproduce the specular sheen.</em></p>
+<p align="center"><img src="docs/figures/stage8_crops.png" width="900"><br>
+<em>Full-resolution crops of a held-out photo for the main Stage 8 runs. Higher training
+resolution and a longer schedule recover the leaf mottling; MCMC is smoother.</em></p>
 
 ## Running it
 
@@ -75,7 +81,7 @@ bash scripts/setup_env.sh                                    # conda envs on /mn
 conda activate gsplat && pytest                              # 54 tests
 python -m src.train --config configs/stage5_lego_adc.yaml    # lego 800², ~15 min
 bash scripts/run_colmap.sh data/plant images_2000 incremental  # plant poses (GPU COLMAP)
-python -m src.train --config configs/stage7_D.yaml           # plant, ~40 min
+python -m src.train --config configs/stage8_base.yaml data.res=2000 train.iterations=60000  # best, ~2 h
 python -m scripts.view_splats --run outputs/<run>            # interactive viewer on :8080
 ```
 
@@ -88,7 +94,7 @@ capture instructions: [docs/CAPTURE_GUIDE.md](docs/CAPTURE_GUIDE.md).
 | [`src/gaussians.py`](src/gaussians.py) · [`src/sh.py`](src/sh.py) | parameters, Σ = R S Sᵀ Rᵀ, SfM/random init, spherical harmonics |
 | [`src/render_torch.py`](src/render_torch.py) · [`src/rasterize.py`](src/rasterize.py) | my renderer: projection, EWA, culling, compositing |
 | [`src/render_gsplat.py`](src/render_gsplat.py) | gsplat behind the same interface |
-| [`src/densify.py`](src/densify.py) | my adaptive density control |
+| [`src/densify.py`](src/densify.py) | my densification: 3DGS ADC (+AbsGS) and 3DGS-MCMC |
 | [`src/camera.py`](src/camera.py) | conventions, Blender and COLMAP loaders |
-| [`src/train.py`](src/train.py) · [`src/losses.py`](src/losses.py) | training loop, metrics |
+| [`src/train.py`](src/train.py) · [`src/evaluate.py`](src/evaluate.py) · [`src/losses.py`](src/losses.py) | training loop, evaluation at any resolution, metrics |
 | [`scripts/`](scripts/) | data pipeline, sweeps, plots, viewer |

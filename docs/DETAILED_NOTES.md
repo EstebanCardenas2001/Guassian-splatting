@@ -802,6 +802,101 @@ in [−1, 1]); PSNR restricted to mask > 0.5; IoU of rendered α > 0.5 with mask
 
 ---
 
+## Stage 8: Pushing the T4 to maximum detail
+
+Code: [`src/densify.py`](../src/densify.py) (`MCMC`, AbsGS via `ADC(absgrad=True)`),
+[`src/train.py`](../src/train.py) (MCMC regularizers, absgrad rendering, `data.cache=cpu`,
+`eval.res`, `optimizer=selective`), [`src/evaluate.py`](../src/evaluate.py),
+[`scripts/profile_stage8.py`](../scripts/profile_stage8.py),
+[`scripts/queue_runner.sh`](../scripts/queue_runner.sh),
+[`scripts/measure_train_peak.py`](../scripts/measure_train_peak.py),
+[`scripts/plot_stage8.py`](../scripts/plot_stage8.py), configs `configs/stage8_*.yaml`.
+
+**Protocol.**
+* Everything is Stage 7 D (SfM init, mask loss, SH 0→3) unless stated.
+* Every run is scored on the same 27 held-out photos **at full resolution (3024×4032)**.
+  Models trained at lower resolution are rendered at full resolution; the Gaussians are
+  continuous. This is the common ground truth. The best run is the one with the lowest
+  LPIPS.
+* Rescored at full resolution, Stage 7 D drops from LPIPS 0.0304 to **0.0659**: the missing
+  fine texture shows up at the photo's real detail.
+
+**New methods.**
+* **AbsGS** accumulates, per Gaussian, the norm of the sum over pixels of |∂L/∂μ′| instead
+  of the norm of the summed gradient, so opposite pulls inside a large Gaussian don't
+  cancel (gsplat `absgrad`).
+* **3DGS-MCMC** (my implementation, tested to give parameters identical to gsplat's
+  `MCMCStrategy` under the same RNG):
+  * relocate dead Gaussians (o ≤ 0.005) onto live ones sampled ∝ o, with
+    o′ = 1 − (1 − o)^(1/n) and the Eq. 9 scale correction (evaluated as a polynomial in o′
+    with a precomputed coefficient table);
+  * grow by 5 % per 100 steps up to a hard cap;
+  * add noise lr·5·10⁵·σ(100(1 − o − 0.995))·Σε to the means;
+  * add L1 regularization of 0.01 on opacity and scale.
+
+**Feasibility** (one full training step, Adam included; Gaussians resampled from Stage 7 D;
+`profile_stage8.py`):
+* Memory is ~1.25 GB per million Gaussians plus a resolution term.
+* Full resolution fits ~4 M Gaussians (7.5 GB, ~1 s/step) and runs out of memory at 6 M.
+* At 2000 px: 0.18–0.67 s/step for 1–6 M Gaussians.
+* So on the T4 the limit is **time**, not memory.
+
+**Results** (30k iterations unless stated; time = training only; peak VRAM = training-only
+peak including the image caches resident on the GPU, see below):
+
+| train res | densification | cap | AA | iters | PSNR | PSNR (plant) | SSIM | LPIPS ↓ | Gaussians | peak VRAM | it/s | time |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1200×1600 | AbsGS (τ=0.0004) | — |  | 30k | 31.47 | 25.51 | 0.9677 | 0.0659 | 336k | 3.5 GB | 12.3 | 41 min |
+| 1200×1600 | ADC (3DGS) | — |  | 30k | 31.44 | 25.48 | 0.9676 | 0.0659 | 390k | 2.3 GB | 12.1 | 41 min |
+| 1200×1600 | ADC (3DGS) | — | ✓ | 30k | 31.79 | 26.15 | 0.9676 | 0.0663 | 379k | 3.5 GB | 12.2 | 41 min |
+| 1200×1600 | MCMC | 1M |  | 30k | 31.67 | 25.73 | 0.9693 | 0.0672 | 1000k | 4.1 GB | 6.3 | 79 min |
+| 1200×1600 | AbsGS (τ=0.0008) | — |  | 30k | 31.44 | 25.50 | 0.9675 | 0.0682 | 141k | 3.3 GB | 15.0 | 33 min |
+| 1500×2000 | ADC (3DGS) | — |  | 60k | 31.74 | 25.90 | 0.9687 | 0.0628 **(best)** | 454k | 4.8 GB | 8.4 | 119 min |
+| 1500×2000 | ADC (3DGS) | — |  | 30k | 31.70 | 25.91 | 0.9691 | 0.0646 | 405k | 4.7 GB | 8.6 | 58 min |
+| 1500×2000 | MCMC | 1M |  | 30k | 31.90 | 26.13 | 0.9705 | 0.0655 | 1000k | 5.2 GB | 5.0 | 101 min |
+| 3024×4032 | ADC (3DGS) | — |  | 30k | 31.92 | 26.43 | 0.9703 | 0.0637 | 388k | 4.3 GB | 2.6 | 193 min |
+
+![Crops](figures/stage8_crops.png)
+
+![LPIPS vs time](figures/stage8_lpips_vs_time.png)
+
+**Readings.**
+* **Training resolution is the main lever.** LPIPS goes 0.0659 → 0.0646 → 0.0637 for
+  1600 → 2000 → full resolution, and plant-only PSNR rises +0.95 dB. Full resolution costs
+  4.7× the time of 1600 px. The full-resolution training images (189 × 12 MP) stay in
+  pinned CPU memory and are copied per step; that costs nothing measurable at ~2.6 it/s.
+* **A longer schedule beats more pixels.** 2000 px × 60k iterations gives **LPIPS 0.0628**,
+  better than full res × 30k (0.0637) in 119 vs 193 min. PSNR barely moves (+0.04 dB): the
+  extra iterations sharpen texture rather than color.
+* **The densification method matters little at fixed resolution.**
+  * AbsGS at τ = 0.0008 (gsplat's suggestion) grows only 141k Gaussians and is worse. At
+    τ = 0.0004 it ties the 3DGS rules exactly (LPIPS 0.0659).
+  * MCMC capped at 1 M gives the best PSNR/SSIM at every resolution but worse LPIPS. The
+    crops show smoother leaf texture: many small, low-opacity Gaussians average detail out.
+* **Anti-aliasing** (Mip-Splatting 2D filter) gives +0.67 dB on the plant when a 1600 px
+  model is rendered at full resolution, with LPIPS unchanged. The crops show no blurring
+  of leaf edges.
+* **Memory.**
+  * The first runs logged a peak that included the periodic full-resolution evaluation
+    (12 MP renders + LPIPS, up to 8.4 GB). The trainer now resets the counter after each
+    evaluation and records a training-only peak.
+  * For earlier runs, that peak was reconstructed as the model + optimizer + render peak,
+    replayed for 10 steps from the final checkpoint (the largest model of the run), plus
+    the resident GPU image caches (train + test at training resolution and the
+    full-resolution evaluation set, uint8 RGB + mask).
+  * The replayed 2000 px run (4.67 GB) agrees with the live measurement of the 60k run
+    (4.79 GB, 12 % more Gaussians).
+  * Every configuration trains in **≤ 5.2 GB** of the T4's 15 GB.
+* **Throughput:** 12 it/s at 1600 px, 8.5 it/s at 2000 px, 2.6 it/s at full resolution (ADC,
+  ~400k Gaussians). MCMC at 1 M halves it.
+* **Failures on the way** (all fixed and re-run):
+  * MCMC crashed on an inherited `opacity_reset` option (configs inherit densify settings;
+    each method now receives only its own fields);
+  * the CPU-cache path indexed CPU masks with GPU indices;
+  * a concurrent Claude session's commit captured a half-applied edit of `train.py`.
+
+---
+
 ## Repository layout
 
 ```
