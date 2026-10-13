@@ -300,6 +300,7 @@ def main(argv=None):
           f"{train_cams[0].height}, backend={cfg.render.backend}, masks={data['train_masks'] is not None}, "
           f"lambda_mask={lam_mask}")
     torch.cuda.reset_peak_memory_stats()
+    train_peak = 0.0          # training-only peak: the counter is reset after every evaluation
     t_last = time.perf_counter()
     for it in range(start + 1, tc.iterations + 1):
         if not order:
@@ -333,6 +334,7 @@ def main(argv=None):
 
         if it % tc.log_every == 0:
             torch.cuda.synchronize()
+            train_peak = max(train_peak, torch.cuda.max_memory_allocated() / 2**30)
             now = time.perf_counter()
             dt = (now - t_last) / tc.log_every
             elapsed += now - t_last
@@ -356,6 +358,8 @@ def main(argv=None):
                 tb.add_scalar(f"test/{k}", v, it)
             print(f"[{it:6d}] test " + "  ".join(f"{k} {v:.4f}" for k, v in r.items()) +
                   f" (subset of {len(eval_idx)})", flush=True)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()  # don't bill evaluation memory to training
             t_last = time.perf_counter()        # don't bill evaluation to training time
         if it % tc.ckpt_every == 0 or it == tc.iterations:
             save_ckpt(it)
@@ -369,6 +373,7 @@ def main(argv=None):
                "iterations": tc.iterations, "train_time_s": elapsed,
                "ms_per_iter_mean": 1e3 * elapsed / max(tc.iterations - start, 1) if start == 0 else None,
                "peak_mem_GB": torch.cuda.max_memory_allocated() / 2**30,
+               "peak_mem_train_GB": train_peak,
                "n_gaussians": len(model), "n_opacity_gt_1_255": int((o > 1 / 255).sum()),
                "backend": cfg.render.backend, "init": cfg.model.init,
                "colors": f"SH{model.sh_degree}" if model.uses_sh else "RGB",
