@@ -152,6 +152,7 @@ def foreground_points(points, cams, masks, min_inside: float = 0.8, min_views: i
         u, v = uv[:, 0].long(), uv[:, 1].long()
         ok = (pc[:, 2] > 0.1) & (u >= 0) & (u < cam.width) & (v >= 0) & (v < cam.height)
         seen += ok
+        m = m.to(points.device, non_blocking=True)        # masks may live in pinned CPU memory
         inside[ok] += (m[v[ok], u[ok]] > 127).float()
     return (seen >= min_views) & (inside >= min_inside * seen.clamp(min=1))
 
