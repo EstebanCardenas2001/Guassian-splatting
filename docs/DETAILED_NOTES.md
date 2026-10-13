@@ -897,6 +897,60 @@ peak including the image caches resident on the GPU, see below):
 
 ---
 
+## Stage 9: Evaluation and deliverables
+
+Code: [`src/export.py`](../src/export.py), [`tests/test_export.py`](../tests/test_export.py),
+[`scripts/plot_stage9.py`](../scripts/plot_stage9.py), [`src/evaluate.py`](../src/evaluate.py).
+
+**Final ablation**, all runs re-scored on the 27 held-out photos at full resolution
+(Stage 7 runs were trained at 1600 px; the ordering is the same as at 1600 px, with larger
+gaps):
+
+| run | PSNR | PSNR (plant only) | SSIM | LPIPS ↓ | Gaussians |
+|---|---|---|---|---|---|
+| A: baseline | 30.18 | 24.23 | 0.9621 | 0.0738 | 74k |
+| B: + mask loss | 30.17 | 24.22 | 0.9621 | 0.0739 | 74k |
+| C: + densification | 30.44 | 24.54 | 0.9637 | 0.0692 | 368k |
+| D: + spherical harmonics | 31.44 | 25.48 | 0.9676 | 0.0659 | 390k |
+| E: D, random init | 31.42 | 25.44 | 0.9672 | 0.0683 | 327k |
+| best Stage 8: 2000 px × 60k | 31.74 | 25.90 | 0.9687 | 0.0628 | 454k |
+
+**Crops of thin parts and blade edges.** Three held-out views, 300×300 windows at full
+resolution, chosen automatically from the ground-truth mask:
+* thin parts = most medial-axis pixels at 2–12 px from the boundary, in windows that are
+  ≥ 20 % foreground;
+* blade edges = most boundary pixels where the blade is > 60 px deep within ~60 px.
+
+The rule finds stems, petioles and a leaf tip for the first kind, and leaf margins for
+the second.
+
+![Edges and stems](figures/stage9_edges_stems.png)
+
+**PLY export.**
+* Layout: x y z, nx ny nz (zeros), f_dc_0..2, f_rest_0..44 (channel-major:
+  f_rest_{c·15+k}), opacity (logit), scale_0..2 (log), rot_0..3 (w, x, y, z), all
+  little-endian float32.
+* Tests:
+  * the header is exactly the 62 standard properties;
+  * every property equals gsplat's `export_splats` output bit for bit;
+  * the round trip is exact and the reloaded model renders identically;
+  * the opacity filter drops only invisible Gaussians.
+* The final model is exported with Gaussians below 1/255 opacity dropped (they never
+  contribute): 342,455 of 453,739, 81 MB.
+
+**Fly-through along interpolated poses.**
+* Keyframes: 16 capture cameras in the 10–45° elevation band, one per azimuth sector.
+* Positions: periodic cubic spline over the unwrapped azimuth. Orientations: scipy
+  `RotationSpline` (C²) over the camera-to-world rotations, with keyframes wrapped on
+  both sides to close the loop.
+* Frames sampled at constant speed in path length (distance + 2 × rotation angle).
+* Before reparameterization, translation speed varied 3.4× (keyframe distances 2.6–6.0).
+  After it, the combined step is uniform (max/median 1.00), translation varies 1.28×, and
+  rotation stays ≤ 1.8° per frame.
+* 300 frames at 960×1280, 30 fps.
+
+---
+
 ## Repository layout
 
 ```

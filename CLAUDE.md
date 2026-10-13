@@ -73,7 +73,7 @@ src/
   sh.py             real spherical harmonics up to degree 3 (view-dependent color)
   train.py          generic trainer (Blender now, COLMAP later): per-param LRs, resume
   evaluate.py       PSNR / SSIM / LPIPS, render test views
-  export.py         .ply in standard 3DGS layout, fly-through video
+  export.py         .ply in standard 3DGS layout (== gsplat exporter + normals), fly-through along interpolated poses
 tests/
 notebooks/
 ```
